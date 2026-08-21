@@ -1,2 +1,2 @@
-# Thulin_etAl_TLR7_IRF5_iHPC_MAS
-Thulin et al. manuscript code for analyzing bulk RNA-seq and ATAC-seq
+# Thulin et al. manuscript (2026) code
+This repository contains the code used for analyzing the bulk RNA-seq and ATAC-seq data and generating figures.
