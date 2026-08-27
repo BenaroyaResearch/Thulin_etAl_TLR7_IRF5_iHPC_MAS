@@ -1,0 +1,633 @@
+---
+title: "TLR7 IRF5 iHPC MAS ATAC HOMER plots"
+output: html_document
+---
+
+Import packages
+```{r}
+library(tidyverse)
+library(dplyr)
+library(purrr)
+library(readr)
+library(stringi)
+library(ComplexHeatmap)
+library(circlize)
+library(universalmotif)
+library(TFBSTools)
+library(viridis)
+```
+
+Set working directory
+```{r}
+setwd("~/atac_analysis/20250507_Natalie_TLR7_chimera_ATAC/differential_peaks/exclude_irf5_tlr7/homer_output/")
+```
+
+# Generate motif similarity matrix
+
+```{r}
+# Define conditions
+homer_files <- c(
+    TLR7_iHPC = "TLR7-iHPC/knownResults.txt", 
+    TLR7_Ly6CMon = "TLR7-Ly6CMon/knownResults.txt", 
+    WT_Ly6CMon = "WT-Ly6CMon/knownResults.txt"
+    )
+```
+
+```{r}
+# Define function to import knownResults.txt
+read_homer <- function(path, condition) {
+  raw_lines <- readLines(path, warn = FALSE)
+  header_line <- raw_lines[1]
+  target_total <- as.numeric(
+    sub(".*# of Target Sequences with Motif\\(of ([0-9]+)\\).*", "\\1", header_line)
+  )
+  bg_total <- as.numeric(
+    sub(".*# of Background Sequences with Motif\\(of ([0-9]+)\\).*", "\\1", header_line)
+  )
+  txt <- paste(raw_lines, collapse = "\n")
+  txt <- stringi::stri_replace_all_regex(txt, "\\p{Zs}+", " ")
+  txt <- gsub("[ \t]+", "\t", txt)
+  df <- readr::read_delim(I(txt), delim = "\t", comment = "#",
+                          col_names = TRUE, show_col_types = FALSE)
+  df %>%
+    dplyr::select(1, 3, 4, 5, 6, 8) %>%
+    rename(
+      `Motif Name`        = 1,
+      `P-value`           = 2,
+      `Log P-value`       = 3,
+      `q-value`           = 4,
+      n_target_with_motif = 5,
+      n_bg_with_motif     = 6
+    ) %>%
+    mutate(
+      Condition    = condition,
+      Motif        = sub("/.*", "", `Motif Name`),
+      target_total = target_total,
+      bg_total     = bg_total
+    ) %>%
+    dplyr::select(
+      Condition, Motif,
+      pvalue  = `P-value`,
+      logP    = `Log P-value`,
+      qvalue  = `q-value`,
+      n_target_with_motif,
+      n_bg_with_motif,
+      target_total,
+      bg_total
+    ) %>%
+    mutate(
+      MotifID = Motif %>%
+        str_replace("/.*$", "") %>%
+        str_replace("\\(.*$", "") %>%
+        str_trim()
+    )
+}
+# Import knownResults.txt for each condition
+knownResults_cellConsensus_df <- purrr::imap_dfr(.x = homer_files, .f = ~ read_homer(path = .x, condition = .y))
+#sig_knownResults_cellConsensus_df <- knownResults_cellConsensus_df %>%
+#  dplyr::filter(qvalue < 0.05 & pvalue <= 1e-20)
+```
+
+Gather PWMs for motifs in motif_union
+```{r}
+# Collect candidate motif files, filter any empty ones
+known_dirs <- tibble(
+  Condition = names(homer_files),
+  known_dir = file.path(dirname(homer_files), "knownResults")
+) %>% 
+  dplyr::filter(dir.exists(known_dir))
+candidate_tbl <- known_dirs %>%
+  mutate(paths = map(known_dir, ~ list.files(.x, pattern = "\\.motif$", full.names = TRUE, recursive = TRUE))) %>%
+  unnest(paths) %>%
+  distinct(Condition, paths) %>%
+  rename(path = paths)
+candidate_motif_files <- unique(candidate_tbl$path)
+candidate_motif_files <- unique(unlist(lapply(file.path(dirname(homer_files), "knownResults"), function(d) {
+  if (!dir.exists(d)) return(character(0))
+  list.files(d, pattern = "\\.motif$", full.names = TRUE, recursive = TRUE)
+}), use.names = FALSE))
+fi <- file.info(candidate_motif_files)
+candidate_motif_files <- candidate_motif_files[!fi$isdir & fi$size > 0]
+# Get name of each motif by reading first line
+get_header_name <- function(p) {
+  con <- file(p, open = "r")
+  on.exit(close(con), add = TRUE)
+  # Read the first non-empty line (header)
+  line <- ""
+  repeat {
+    line <- readLines(con, n = 1, warn = FALSE)
+    if (length(line) == 0 || nzchar(line)) break
+  }
+  if (length(line) == 0) return(NA_character_)
+  # --- Primary path: regex extraction ---
+  # Pattern: 
+  #   ^>\s*         : start, '>' and optional spaces
+  #   [^\t]+        : first field (motif sequence) up to TAB
+  #   \t\s*         : TAB + optional spaces
+  #   ([^/\t]+)     : CAPTURE second field up to first '/' or TAB
+  rx <- "^>\\s*[^\\t]+\\t\\s*([^/\\t]+)"
+  m <- regexec(rx, line, perl = TRUE)
+  cap <- regmatches(line, m)
+  if (length(cap) > 0 && length(cap[[1]]) >= 2) {
+    id <- trimws(cap[[1]][2])
+    if (nzchar(id)) return(id)
+  }
+  # --- Fallback path: split by TAB, then split field 2 at '/' ---
+  parts <- strsplit(line, "\t", fixed = TRUE)[[1]]
+  if (length(parts) >= 2) {
+    id2 <- trimws(strsplit(parts[2], "/", fixed = TRUE)[[1]][1])
+    if (!is.na(id2) && nzchar(id2)) return(id2)
+  }
+  # If all else fails
+  NA_character_
+}
+ids <- lapply(candidate_motif_files, get_header_name)
+ids <- unlist(ids, use.names = FALSE)
+# Build a motif ID -> paths map (handle duplicates by keeping first file)
+idx_df <- data.frame(id = ids, path = candidate_motif_files, stringsAsFactors = FALSE) |>
+  subset(!is.na(id) & nzchar(id))
+idx_df <- idx_df[!duplicated(idx_df$id), , drop = FALSE]
+# Filter to motifs in Natalie's list
+motifs_needed_df <- read.csv("CellTypeConsensus_TF_motifsNeeded.csv", header = FALSE)
+colnames(motifs_needed_df)[1] <- "motif_name"
+motifs_needed_df$motif_name <- sub("/.*", "", motifs_needed_df$motif_name)
+motifs_needed <- as.character(motifs_needed_df$motif_name)
+needed_paths <- idx_df$path[match(motifs_needed, idx_df$id)]
+has_path <- !is.na(needed_paths)
+motifs_needed <- motifs_needed[has_path]
+needed_paths  <- needed_paths[has_path]
+# Read PWMs of motifs
+read_one <- function(p) {
+  tryCatch(
+    universalmotif::read_homer(p),
+    error = function(e) {
+      # fallback to autodetect in case the file isn't strict HOMER
+      tryCatch(universalmotif::read_motifs(p, autodetect = TRUE), error = function(e) NULL)
+    }
+  )
+}
+motifs_list_of_lists <- lapply(needed_paths, read_one)
+motifs_all <- unlist(motifs_list_of_lists, recursive = FALSE, use.names = FALSE)
+motifs_all <- Filter(Negate(is.null), motifs_all)
+length(motifs_all)
+```
+
+Filter out low information motifs (very low complexity/degenerate with nearly uniform A/C/G/T columns)
+```{r}
+motif_ic <- vapply(
+  motifs_all,
+  function(m) sum(m@icscore, na.rm = TRUE),
+  numeric(1)
+)
+min_ic <- 8
+motifs_filt <- motifs_all[motif_ic >= min_ic]
+length(motifs_all) # 116
+length(motifs_filt) # 111
+names(motifs_filt) <- vapply(
+  motifs_filt,
+  function(m) paste0(m@name, "(", m@family, ")"),
+  character(1)
+)
+motifs_filt <- lapply(motifs_filt, function(m) {
+  m@name <- paste0(m@name, "(", m@family, ")")
+  m
+})
+low_ic_motifs <- Filter(function(x) x@icscore < min_ic, motifs_all)
+```
+
+Compute similarity dendrogram and cluster
+```{r}
+sim_mat  <- compare_motifs(motifs_filt, method = "PCC", min.overlap = 5)
+dist_mat <- as.dist(1 - sim_mat)
+row_clust <- hclust(dist_mat, method = "average")
+cluster_motifs <- names(motifs_filt)
+write.csv(sim_mat, "CellTypeConsensus_TFmotif_SimilarityMatrix.csv", row.names = TRUE)
+```
+
+Plot similarity heatmap ordered by dendrogram
+```{r}
+col_fun_sim <- colorRamp2(c(0, 0.5, 1), c("white", "yellow", "red"))
+#pdf(file = "CellTypeConsensus_TFmotif_heatmap.pdf", width = 28, height = 25)
+Heatmap(
+    sim_mat,
+    name = "Similarity\n(Pearson correlation\ncoefficient)",
+    col = col_fun_sim,
+    cluster_rows = as.dendrogram(row_clust),
+    cluster_columns = as.dendrogram(row_clust),
+    row_names_side = "left",
+    column_names_side = "top",
+    show_row_dend = TRUE,
+    show_column_dend = TRUE,
+    rect_gp = grid::gpar(col = NA)
+)
+#dev.off()
+```
+
+# Build all motifs heatmap for TLR7 iHPC vs. Ly6C monocytes integrated with RNAseq data, no IRF5 ChIP overlap
+
+Assign groups of similar known motifs per Natalie's motif lists + aggregate counts
+```{r}
+motif_group_defin_df <- read.csv("05112026_motifCategories.csv", header = FALSE, stringsAsFactors = FALSE)
+
+# Build list of motif groups
+motif_groups <- setNames(
+  lapply(seq_len(nrow(motif_group_defin_df)), function(i) {
+    row_vals <- as.character(motif_group_defin_df[i, ])
+    row_vals <- row_vals[row_vals != ""]  # remove empty cells if any
+    row_vals[-1]  # everything after first column
+  }),
+  motif_group_defin_df[[1]]  # first column as names
+)
+
+# Build a motif to group mapping data frame
+motif_group_df <- stack(motif_groups) %>%
+  rename(Motif = values, RepMotif = ind) %>%
+  mutate(
+    RepMotif   = as.character(RepMotif),
+    MotifGroup = paste0("Group_", RepMotif)
+  )
+```
+
+Import HOMER output files
+```{r}
+# Define conditions
+homer_files_diffPeaks_rnaAtac <- c(
+  iHPC = "TLR7-iHPC_RNA_ATAC_integrated/knownResults.txt", 
+  Ly6CMon = "TLR7-Ly6CMon_RNA_ATAC_integrated/knownResults.txt" 
+  )
+# Import knownResults.txt for each condition
+knownResults_diffPeaks_rnaAtac_df <- purrr::imap_dfr(.x = homer_files_diffPeaks_rnaAtac, .f = ~ read_homer(path = .x, condition = .y))
+sig_knownResults_diffPeaks_rnaAtac_df <- knownResults_diffPeaks_rnaAtac_df %>%
+  dplyr::filter(qvalue < 0.05)
+```
+
+Aggregate counts across motif groups per replicate, then compute log2FC for % of motifs in target over background
+```{r}
+agg_diffPeaks_motif_df <- sig_knownResults_diffPeaks_rnaAtac_df %>%
+  inner_join(motif_group_df, by = "Motif") %>%
+  group_by(Condition, MotifGroup, RepMotif,
+           target_total, bg_total) %>%
+  dplyr::summarize(
+    sum_n_target = sum(n_target_with_motif, na.rm = TRUE),
+    sum_n_bg     = sum(n_bg_with_motif,     na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Condition, MotifGroup, RepMotif) %>%
+  dplyr::summarize(
+    sum_n_target = sum(sum_n_target),
+    sum_n_bg     = sum(sum_n_bg),
+    target_total = dplyr::first(target_total),
+    bg_total     = dplyr::first(bg_total),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pct_target = sum_n_target / target_total,
+    pct_bg     = sum_n_bg     / bg_total,
+    log2FC     = log2((pct_target + 1e-6) / (pct_bg + 1e-6))
+  )
+```
+
+Build log2FC matrix and plot heatmap
+```{r}
+# Pivot to matrix (rows = representative motif label, cols = condition)
+log2fc_mat_diffPeaks <- agg_diffPeaks_motif_df %>%
+  dplyr::select(RepMotif, Condition, log2FC) %>%
+  mutate(Condition = dplyr::recode(Condition,
+    "iHPC"      = "More accessible in iHPCs",
+    "Ly6CMon"   = "More accessible in TLR7 monocytes"
+  )) %>%
+  pivot_wider(names_from = Condition, values_from = log2FC) %>%
+  column_to_rownames("RepMotif") %>%
+  as.matrix()
+# Color scale
+max_fc_diffPeaks <- max(abs(log2fc_mat_diffPeaks), na.rm = TRUE)
+col_fun_diffPeaks <- circlize::colorRamp2(
+  seq(0, max_fc_diffPeaks, length.out = 100),
+  magma(100)
+)
+# Remove rows that would break clustering (all-NA)
+giveNAs_diffPeaks  <- which(is.na(as.matrix(dist(log2fc_mat_diffPeaks))), arr.ind = TRUE)
+if (nrow(giveNAs_diffPeaks) > 0) {
+  tab      <- sort(table(c(giveNAs_diffPeaks)), decreasing = TRUE)
+  checkNA  <- sapply(seq_along(tab), function(i)
+    sum(is.na(as.matrix(dist(log2fc_mat_diffPeaks[-as.numeric(names(tab[1:i])), ])))))
+  rmv      <- names(tab)[1:min(which(checkNA == 0))]
+  log2fc_mat_diffPeaks <- log2fc_mat_diffPeaks[-as.numeric(rmv), ]
+}
+#pdf(file = "homer_heatmaps/Ly6CMoniHPC_diffPeaks_rnaAtacIntegrated_heatmap.pdf", width = 8, height = 6)
+Heatmap(
+  log2fc_mat_diffPeaks,
+  name = "log2(% target /\n% background)",
+  column_title  = "Peak motif enrichment",
+  col = col_fun_diffPeaks,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  row_names_side = "left",
+  column_names_rot = 30,
+  rect_gp = grid::gpar(col = "white", lwd = 0.5),
+  na_col = "grey90"
+)
+#dev.off()
+```
+
+# Build all motifs heatmap for results for TLR7 iHPC vs. Ly6C monocytes integrated with RNAseq data and IRF5 ChIP overlap
+
+Assign groups of similar known motifs per Natalie's motif lists w/o GFX + aggregate counts
+```{r}
+motif_group_defin_noGFX_df <- read.csv("05112026_motifCategories_noGFX.csv", header = FALSE, stringsAsFactors = FALSE)
+
+# Build list of motif groups
+motif_groups_noGFX <- setNames(
+  lapply(seq_len(nrow(motif_group_defin_noGFX_df)), function(i) {
+    row_vals <- as.character(motif_group_defin_noGFX_df[i, ])
+    row_vals <- row_vals[row_vals != ""]  # remove empty cells if any
+    row_vals[-1]  # everything after first column
+  }),
+  motif_group_defin_noGFX_df[[1]]  # first column as names
+)
+
+# Build a motif to group mapping data frame
+motif_group_noGFX_df <- stack(motif_groups_noGFX) %>%
+  rename(Motif = values, RepMotif = ind) %>%
+  mutate(
+    RepMotif   = as.character(RepMotif),
+    MotifGroup = paste0("Group_", RepMotif)
+  )
+```
+
+Import HOMER output files
+```{r}
+# Define conditions
+homer_files_diffPeaks_rnaAtac_IRF5 <- c(
+  iHPC = "TLR7-iHPC_RNA_ATAC_integrated/irf5_bound/knownResults.txt", 
+  Ly6CMon = "TLR7-Ly6CMon_RNA_ATAC_integrated/irf5_bound/knownResults.txt" 
+  )
+# Import knownResults.txt for each condition
+knownResults_diffPeaks_rnaAtac_IRF5_df <- purrr::imap_dfr(.x = homer_files_diffPeaks_rnaAtac_IRF5, .f = ~ read_homer(path = .x, condition = .y))
+sig_knownResults_diffPeaks_rnaAtac_IRF5_df <- knownResults_diffPeaks_rnaAtac_IRF5_df %>%
+  dplyr::filter(qvalue < 0.05)
+```
+
+Aggregate counts across motif groups per replicate, then compute log2FC for % of motifs in target over background
+```{r}
+agg_diffPeaks_IRF5_motif_df <- sig_knownResults_diffPeaks_rnaAtac_IRF5_df %>%
+  inner_join(motif_group_df, by = "Motif") %>%
+  group_by(Condition, MotifGroup, RepMotif,
+           target_total, bg_total) %>%
+  dplyr::summarize(
+    sum_n_target = sum(n_target_with_motif, na.rm = TRUE),
+    sum_n_bg     = sum(n_bg_with_motif,     na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Condition, MotifGroup, RepMotif) %>%
+  dplyr::summarize(
+    sum_n_target = sum(sum_n_target),
+    sum_n_bg     = sum(sum_n_bg),
+    target_total = dplyr::first(target_total),
+    bg_total     = dplyr::first(bg_total),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pct_target = sum_n_target / target_total,
+    pct_bg     = sum_n_bg     / bg_total,
+    log2FC     = log2((pct_target + 1e-6) / (pct_bg + 1e-6))
+  )
+```
+
+Build log2FC matrix and plot heatmap
+```{r}
+# Pivot to matrix (rows = representative motif label, cols = condition)
+log2fc_mat_diffPeaks_IRF5 <- agg_diffPeaks_IRF5_motif_df %>%
+  dplyr::select(RepMotif, Condition, log2FC) %>%
+  mutate(Condition = dplyr::recode(Condition,
+    "iHPC"      = "More accessible in iHPCs",
+    "Ly6CMon"   = "More accessible in TLR7 monocytes"
+  )) %>%
+  pivot_wider(names_from = Condition, values_from = log2FC) %>%
+  column_to_rownames("RepMotif") %>%
+  as.matrix()
+# Color scale
+max_fc_diffPeaks_IRF5 <- max(abs(log2fc_mat_diffPeaks_IRF5), na.rm = TRUE)
+col_fun_diffPeaks_IRF5 <- circlize::colorRamp2(
+  seq(0, max_fc_diffPeaks_IRF5, length.out = 100),
+  magma(100)
+)
+# Remove rows that would break clustering (all-NA)
+giveNAs_diffPeaks_IRF5  <- which(is.na(as.matrix(dist(log2fc_mat_diffPeaks_IRF5))), arr.ind = TRUE)
+if (nrow(giveNAs_diffPeaks_IRF5) > 0) {
+  tab      <- sort(table(c(giveNAs_diffPeaks_IRF5)), decreasing = TRUE)
+  checkNA  <- sapply(seq_along(tab), function(i)
+    sum(is.na(as.matrix(dist(log2fc_mat_diffPeaks_IRF5[-as.numeric(names(tab[1:i])), ])))))
+  rmv      <- names(tab)[1:min(which(checkNA == 0))]
+  log2fc_mat_diffPeaks_IRF5 <- log2fc_mat_diffPeaks_IRF5[-as.numeric(rmv), ]
+}
+#pdf(file = "homer_heatmaps/Ly6CMoniHPC_diffPeaks_rnaAtacIntegrated_IRF5bound_heatmap.pdf", width = 8, height = 6)
+Heatmap(
+  log2fc_mat_diffPeaks_IRF5,
+  name = "log2(% target /\n% background)",
+  column_title  = "Peak motif enrichment (IRF5 ChIP overlap)",
+  col = col_fun_diffPeaks_IRF5,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  row_names_side = "left",
+  column_names_rot = 30,
+  rect_gp = grid::gpar(col = "white", lwd = 0.5),
+  na_col = "grey90"
+)
+#dev.off()
+```
+
+# Set up for IRF heatmaps + IRF motif groups
+
+Manually assign groups of similar IRF motifs per Natalie's motif lists
+```{r}
+# Define motif groups
+irf_motif_groups <- list(
+  "IRF alone" = c("IRF4(IRF)"),
+  "IRF-IRF" = c("IRF1(IRF)", "IRF2(IRF)", "ISRE(IRF)", "T1ISRE(IRF)"),
+  "ETS-IRF" = c("PU.1:IRF8(ETS:IRF)", "PU.1-IRF(ETS:IRF)"),
+  "AP1-IRF" = c("bZIP:IRF(bZIP,IRF)", "IRF:BATF(IRF:bZIP)")
+)
+
+# Build a motif to group mapping data frame
+irf_motif_group_df <- stack(irf_motif_groups) %>%
+  rename(Motif = values, RepMotif = ind) %>%
+  mutate(
+    RepMotif   = as.character(RepMotif),
+    MotifGroup = paste0("Group_", RepMotif)
+  )
+```
+
+# TLR7 monocytes vs iHPC differential peaks integrated with RNAseq, no IRF5 ChIP overlap
+
+Import HOMER output files
+```{r}
+# Define conditions
+homer_files_diffPeaks_rnaAtac <- c(
+  iHPC = "TLR7-iHPC_RNA_ATAC_integrated/knownResults.txt", 
+  Ly6CMon = "TLR7-Ly6CMon_RNA_ATAC_integrated/knownResults.txt" 
+  )
+# Import knownResults.txt for each condition
+knownResults_diffPeaks_rnaAtac_df <- purrr::imap_dfr(.x = homer_files_diffPeaks_rnaAtac, .f = ~ read_homer(path = .x, condition = .y))
+sig_knownResults_diffPeaks_rnaAtac_df <- knownResults_diffPeaks_rnaAtac_df %>%
+  dplyr::filter(qvalue < 0.05)
+```
+
+Aggregate counts across IRF motif groups
+```{r}
+# Aggregate counts across motif groups, then compute log2FC for % of motifs in target over background
+agg_diffPeaks_rnaAtac_motif_df <- sig_knownResults_diffPeaks_rnaAtac_df %>%
+  inner_join(irf_motif_group_df, by = "Motif") %>%
+  group_by(Condition, MotifGroup, RepMotif,
+           target_total, bg_total) %>%
+  dplyr::summarize(
+    sum_n_target = sum(n_target_with_motif, na.rm = TRUE),
+    sum_n_bg     = sum(n_bg_with_motif,     na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Condition, MotifGroup, RepMotif) %>%
+  dplyr::summarize(
+    sum_n_target = sum(sum_n_target),
+    sum_n_bg     = sum(sum_n_bg),
+    target_total = dplyr::first(target_total),
+    bg_total     = dplyr::first(bg_total),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pct_target = sum_n_target / target_total,
+    pct_bg     = sum_n_bg     / bg_total,
+    log2FC     = log2((pct_target + 1e-6) / (pct_bg + 1e-6))
+  )
+```
+
+Build log2FC matrix and plot
+```{r}
+# Pivot to matrix (rows = representative motif label, cols = condition)
+log2fc_mat_diffPeaks_rnaAtac <- agg_diffPeaks_rnaAtac_motif_df %>%
+  dplyr::select(RepMotif, Condition, log2FC) %>%
+  mutate(Condition = dplyr::recode(Condition,
+    "iHPC"      = "More accessible in iHPCs",
+    "Ly6CMon"   = "More accessible in TLR7 monocytes"
+  )) %>%
+  pivot_wider(names_from = Condition, values_from = log2FC) %>%
+  column_to_rownames("RepMotif") %>%
+  as.matrix()
+
+# Color scale
+max_fc_diffPeaks_rnaAtac <- max(abs(log2fc_mat_diffPeaks_rnaAtac), na.rm = TRUE)
+col_fun_diffPeaks_rnaAtac <- circlize::colorRamp2(
+  seq(0, max_fc_diffPeaks_rnaAtac, length.out = 100),
+  viridis(100)
+)
+
+# Remove rows that would break clustering (all-NA)
+giveNAs_diffPeaks_rnaAtac  <- which(is.na(as.matrix(dist(log2fc_mat_diffPeaks_rnaAtac))), arr.ind = TRUE)
+if (nrow(giveNAs_diffPeaks_rnaAtac) > 0) {
+  tab      <- sort(table(c(giveNAs_diffPeaks_rnaAtac)), decreasing = TRUE)
+  checkNA  <- sapply(seq_along(tab), function(i)
+    sum(is.na(as.matrix(dist(log2fc_mat_diffPeaks_rnaAtac[-as.numeric(names(tab[1:i])), ])))))
+  rmv      <- names(tab)[1:min(which(checkNA == 0))]
+  log2fc_mat_diffPeaks_rnaAtac <- log2fc_mat_diffPeaks_rnaAtac[-as.numeric(rmv), ]
+}
+#pdf(file = "homer_heatmaps/Ly6CMoniHPC_diffPeaks_rnaAtacIntegrated_IRF_heatmap.pdf", width = 8, height = 6)
+Heatmap(
+  log2fc_mat_diffPeaks_rnaAtac,
+  name = "log2(% target /\n% background)",
+  column_title  = "Peak motif enrichment",
+  col = col_fun_diffPeaks_rnaAtac,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  row_names_side = "left",
+  column_names_rot = 30,
+  rect_gp = grid::gpar(col = "white", lwd = 0.5),
+  na_col = "grey90"
+)
+#dev.off()
+```
+
+# TLR7 monocytes vs iHPC differential peaks integrated with RNAseq with IRF5 ChIP overlap
+
+Import HOMER output files
+```{r}
+# Define conditions
+homer_files_diffPeaks_rnaAtac_IRF5 <- c(
+  iHPC = "TLR7-iHPC_RNA_ATAC_integrated/irf5_bound/knownResults.txt", 
+  Ly6CMon = "TLR7-Ly6CMon_RNA_ATAC_integrated/irf5_bound/knownResults.txt" 
+  )
+# Import knownResults.txt for each condition
+knownResults_diffPeaks_rnaAtac_IRF5_df <- purrr::imap_dfr(.x = homer_files_diffPeaks_rnaAtac_IRF5, .f = ~ read_homer(path = .x, condition = .y))
+sig_knownResults_diffPeaks_rnaAtac_IRF5_df <- knownResults_diffPeaks_rnaAtac_IRF5_df %>%
+  dplyr::filter(qvalue < 0.05)
+```
+
+Aggregate counts across IRF motif groups
+```{r}
+# Aggregate counts across motif groups, then compute log2FC for % of motifs in target over background
+agg_diffPeaks_rnaAtac_IRF5_motif_df <- sig_knownResults_diffPeaks_rnaAtac_IRF5_df %>%
+  inner_join(irf_motif_group_df, by = "Motif") %>%
+  group_by(Condition, MotifGroup, RepMotif,
+           target_total, bg_total) %>%
+  dplyr::summarize(
+    sum_n_target = sum(n_target_with_motif, na.rm = TRUE),
+    sum_n_bg     = sum(n_bg_with_motif,     na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Condition, MotifGroup, RepMotif) %>%
+  dplyr::summarize(
+    sum_n_target = sum(sum_n_target),
+    sum_n_bg     = sum(sum_n_bg),
+    target_total = dplyr::first(target_total),
+    bg_total     = dplyr::first(bg_total),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pct_target = sum_n_target / target_total,
+    pct_bg     = sum_n_bg     / bg_total,
+    log2FC     = log2((pct_target + 1e-6) / (pct_bg + 1e-6))
+  )
+```
+
+Build log2FC matrix and plot
+```{r}
+# Pivot to matrix (rows = representative motif label, cols = condition)
+log2fc_mat_diffPeaks_rnaAtac_IRF5 <- agg_diffPeaks_rnaAtac_IRF5_motif_df %>%
+  dplyr::select(RepMotif, Condition, log2FC) %>%
+  mutate(Condition = dplyr::recode(Condition,
+    "iHPC"      = "More accessible in iHPCs",
+    "Ly6CMon"   = "More accessible in TLR7 monocytes"
+  )) %>%
+  pivot_wider(names_from = Condition, values_from = log2FC) %>%
+  column_to_rownames("RepMotif") %>%
+  as.matrix()
+
+# Color scale
+max_fc_diffPeaks_rnaAtac_IRF5 <- max(abs(log2fc_mat_diffPeaks_rnaAtac_IRF5), na.rm = TRUE)
+col_fun_diffPeaks_rnaAtac_IRF5 <- circlize::colorRamp2(
+  seq(0, max_fc_diffPeaks_rnaAtac_IRF5, length.out = 100),
+  magma(100)
+)
+
+# Remove rows that would break clustering (all-NA)
+giveNAs_diffPeaks_rnaAtac_IRF5  <- which(is.na(as.matrix(dist(log2fc_mat_diffPeaks_rnaAtac_IRF5))), arr.ind = TRUE)
+if (nrow(giveNAs_diffPeaks_rnaAtac_IRF5) > 0) {
+  tab      <- sort(table(c(giveNAs_diffPeaks_rnaAtac_IRF5)), decreasing = TRUE)
+  checkNA  <- sapply(seq_along(tab), function(i)
+    sum(is.na(as.matrix(dist(log2fc_mat_diffPeaks_rnaAtac_IRF5[-as.numeric(names(tab[1:i])), ])))))
+  rmv      <- names(tab)[1:min(which(checkNA == 0))]
+  log2fc_mat_diffPeaks_rnaAtac_IRF5 <- log2fc_mat_diffPeaks_rnaAtac_IRF5[-as.numeric(rmv), ]
+}
+#pdf(file = "homer_heatmaps/Ly6CMoniHPC_diffPeaks_rnaAtacIntegrated_IRF5bound_IRF_heatmap.pdf", width = 8, height = 6)
+Heatmap(
+  log2fc_mat_diffPeaks_rnaAtac_IRF5,
+  name = "log2(% target /\n% background)",
+  column_title  = "Peak motif enrichment (IRF5-bound sites)",
+  col = col_fun_diffPeaks_rnaAtac_IRF5,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  row_names_side = "left",
+  column_names_rot = 30,
+  rect_gp = grid::gpar(col = "white", lwd = 0.5),
+  na_col = "grey90"
+)
+#dev.off()
+```

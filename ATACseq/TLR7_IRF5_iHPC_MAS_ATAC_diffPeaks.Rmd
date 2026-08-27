@@ -1,0 +1,1872 @@
+---
+title: "TLR7 IRF5 iHPC MAS ATAC differential peak analysis"
+output: html_document
+---
+
+```{r load packages echo = FALSE, message = FALSE, warning = FALSE}
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(soGGi)
+library(chromVAR)
+library(TxDb.Mmusculus.UCSC.mm39.knownGene)
+library(Rsamtools)
+library(GenomicAlignments)
+library(DiffBind)
+library(edgeR)
+library(plotly)
+library(ensembldb)
+library(AnnotationHub)
+library(ChIPpeakAnno)
+library(org.Mm.eg.db)
+library(biomaRt)
+library(rtracklayer)
+library(limma)
+library(ggrepel)
+library(chromVAR)
+library(SummarizedExperiment)
+library(BSgenome.Mmusculus.UCSC.mm39)
+library(universalmotif)
+library(motifmatchr)
+library(TFBSTools)
+library(plyranges)
+library(excluderanges)
+setwd("~/atac_analysis/20250507_Natalie_TLR7_chimera_ATAC/")
+```
+
+## TSSe (from Stephan's ATAC-seq analysis)
+From Stephan: Another good plot to look at is the transcription start site enhancement. In ATAC we would know to be looking for an enhancement at the TSSe - in Cut and Run the pile up depends on the histone. 
+
+> ENCODE: Transcription start site (TSS) enrichment values are dependent on the reference files used; cutoff values for high quality data are listed in the table below. 
+
+For `GRCh38 Refseq TSS annotation` we are looking for >7, while 5-7 is still acceptable, for `mm10 Refseq TSS annotation` (GRCm38), 10-15 is acceptable, > 15 is ideal.
+
+Define function to calculate TSS
+```{r calculate TSS coverage with soGGi and chromVAR - define function}
+calculateCoverage = function(bamfile, ref) {
+  distanceToTSS = -1500:1500
+  coverage_ <- regionPlot(bamFile = bamfile, 
+                          testRanges = ref, style = "point", 
+                          format = "bam", paired = TRUE,
+                          minFragmentLength = 0, 
+                          maxFragmentLength = 500, 
+                          normalize = "RPM")
+  
+  coverage = as.vector(colSums(coverage_@assays@data@listData[[1]]))
+  coverage = coverage/min(coverage)
+  
+  coverage = data.frame(distanceToTSS, coverage)
+  
+  colnames(coverage) <- c("distanceToTSS", "aggregateTSSscore")
+  
+  return(coverage)
+}
+```
+
+Get TSSs
+```{r get TSSs}
+TSSs <- resize(genes(TxDb.Mmusculus.UCSC.mm39.knownGene), fix = "start", 1)
+seqlevelsStyle(TSSs) <- "NCBI"
+TSSs
+```
+
+Load BAM files
+```{r load bam files}
+# List all reheadered BAM files
+bam_dir <- "dedup"
+bam_files_for_tss <- list.files(path = bam_dir, pattern = "\\.dedup\\.reheader\\.bam$", full.names = TRUE)
+
+# Load BAM files and get list of sample names
+bam_sample_list <- c()
+bam_list <- list()
+for (bam_file in bam_files_for_tss) {
+  sample_name <- sub("\\.dedup\\.reheader\\.bam$", "", basename(bam_file))
+  bam_sample_list <- c(bam_sample_list, sample_name)
+  bam_data <- bam_file
+  bam_list[[sample_name]] <- bam_data
+}
+```
+
+Calculate TSS coverage and plot for each sample
+```{r calculate TSS coverage and plot}
+tss_plots_pdf <- "plots/tss_coverage.pdf"
+pdf(file = tss_plots_pdf, width = 8, height = 6)
+tss_coverage_list <- list()
+for (sample in bam_list) {
+  # Calculate TSS
+  sample_name <- sub("dedup/(.*)\\.dedup\\.reheader\\.bam", "\\1", sample)
+  TSS_coverage <- c()
+  TSS_coverage_ <- calculateCoverage(sample, TSSs)
+  TSS_coverage <- rbind(TSS_coverage, TSS_coverage_)
+  tss_coverage_list[[sample_name]] <- TSS_coverage
+  # Plot TSS
+  plot <- TSS_coverage %>%
+    ggplot(aes(x = distanceToTSS, y = aggregateTSSscore)) +
+    geom_line() +
+    ggtitle(paste(sample_name)) +
+    labs(x = "distance to TSS (bp)", y = "aggregate, normalized TSS score") +
+    theme_bw() +
+    theme(legend.position="right") + 
+    theme(legend.direction='vertical')
+  # Print TSS plot to PDF device
+  print(plot)
+}
+dev.off()
+
+# Export TSS coverage dataframes
+for (sample in names(tss_coverage_list)) {
+  tss_df = tss_coverage_list[[sample]]
+  write.csv(tss_df, paste0("plots/tss_coverage_data/", sample, "_tss_data.csv"), row.names = F)
+}
+```
+
+Get TSSe scores for each sample
+```{r get TSSe scores}
+tss_scores <- data.frame(
+  sample = names(tss_coverage_list),
+  tss_score = sapply(tss_coverage_list, function(x) max(x$aggregateTSSscore, na.rm = TRUE))
+)
+```
+
+
+## Fragment size distribution
+From Stephan: One good metric to see if tagmentation worked as expected, is to look at the fragment size distributions. Fragment size distributions are particularly useful in ATACseq where you expect a peak around 100 bp (nucleosome free region) and then oscillations with maxima 200 bp mono-nucleosome, 400 bp di-nucleosome and so on.
+
+> ENCODE: A nucleosome free region (NFR) must be present. A mononucleosome peak must be present in the fragment length distribution. These are reads that span a single nucleosome, so they are longer than 147 bp but shorter than 147*2 bp. Good ATAC-seq datasets have reads that span nucleosomes (which allows for calling nucleosome positions in addition to open regions of chromatin).
+
+I used samtools to get fragment size counts, using code from here: https://dbrg77.wordpress.com/2017/02/10/atac-seq-insert-size-plotting/.
+
+Plot fragment size distributions
+```{r plot fragment size distribution for PEG 1}
+fragment_size_plots_pdf <- "plots/fragment_size_distributions.pdf"
+pdf(file = fragment_size_plots_pdf, width = 8, height = 6)
+
+for (sample_name in sample_list) {
+  # Get fragment size counts
+  frag_sizes <- read.csv(paste0("fragment_size/", sample_name, ".fragment_length_count.txt"), sep = " ", header = T)
+  colnames(frag_sizes) <- c("counts", "fragment_length")
+  # Plot fragment size distributions
+  frag_size_plot  <- frag_sizes %>%
+    ggplot(aes(x = fragment_length, y = counts))+
+    geom_line() +
+    ggtitle(paste(sample_name)) +
+    labs(x = "Fragment length (bp)", y = "Counts", color = "") +
+    scale_x_continuous(breaks = seq(0, 1400, by=200), limits=c(0,1400)) +
+    theme_bw()
+  # Print fragment size plot to PDF device
+  plot(frag_size_plot)
+}
+
+dev.off()
+```
+
+## Estimated library size from Picard MarkDuplicates
+Picard MarkDuplicates identifies duplicated reads and estimates the library size with duplicate reads removed.
+
+Import all MarkDuplicates output files and get estimated library sizes
+```{r import Picard MarkDuplicates output}
+dedup_output_list <- list.files(path = "dedup/metrics", pattern="\\.picard_metrics\\.txt$", full.names = T)
+picard_library_sizes <- list()
+for (file in dedup_output_list) {
+  lines <- readLines(file)
+  metrics_start <- grep("^## METRICS CLASS", lines)
+  if (length(metrics_start) > 0 && length(lines) > metrics_start + 2) {
+    header <- strsplit(lines[metrics_start + 1], "\t")[[1]]
+    values <- strsplit(lines[metrics_start + 2], "\t")[[1]]
+    estimated_library_size_index <- which(header == "ESTIMATED_LIBRARY_SIZE")
+    if (length(estimated_library_size_index) > 0) {
+      estimated_library_size <- values[estimated_library_size_index]
+      sample <- basename(file)
+      sample <- sub("\\.picard_metrics\\.txt$", "", sample)
+      picard_library_sizes[[sample]] <- as.numeric(estimated_library_size)
+    }
+  }
+}
+estimated_library_sizes <- data.frame(
+  sample = names(picard_library_sizes),
+  estimated_library_size = unlist(picard_library_sizes)
+)
+rownames(estimated_library_sizes) <- NULL
+```
+
+Get percent duplication
+```{r get Picard percent duplication}
+picard_percent_dup <- list()
+for (file in dedup_output_list) {
+  lines <- readLines(file)
+  metrics_start <- grep("^## METRICS CLASS", lines)
+  if (length(metrics_start) > 0 && length(lines) > metrics_start + 2) {
+    header <- strsplit(lines[metrics_start + 1], "\t")[[1]]
+    values <- strsplit(lines[metrics_start + 2], "\t")[[1]]
+    percent_duplication_index <- which(header == "PERCENT_DUPLICATION")
+    if (length(percent_duplication_index) > 0) {
+      percent_duplication <- values[percent_duplication_index]
+      sample <- basename(file)
+      sample <- sub("\\.picard_metrics\\.txt$", "", sample)
+      picard_percent_dup[[sample]] <- as.numeric(percent_duplication) * 100
+    }
+  }
+}
+picard_percent_dup <- data.frame(
+  sample = names(picard_percent_dup),
+  percent_duplication = unlist(picard_percent_dup)
+)
+rownames(picard_percent_dup) <- NULL
+```
+
+## Calculating fraction of reads in peak (FRiP) scores
+ENCODE: The fraction of reads in called peak regions (FRiP score) should be >0.3, though values greater than 0.2 are acceptable. For EN-TEx tissues, FRiP scores will not be enforced as QC metric. TSS enrichment remains in place as a key signal to noise measure.
+
+Total reads and reads in peaks were calculated using samtools and bedtools as outlined at https://yiweiniu.github.io/blog/2019/03/ATAC-seq-data-analysis-from-FASTQ-to-peaks/. 
+
+```{r calculate FRiP scores}
+total_reads_files <- list.files(path="frip", pattern="*.total_reads.txt", full.names=T)
+reads_in_peaks_files <- list.files(path="frip/new_cutoff", pattern="*.hmmratac_reads_in_peaks.txt", full.names=T)
+
+total_reads <- as.numeric(unlist(lapply(total_reads_files, function(x)readLines(x))))
+reads_in_peaks <- as.numeric(unlist(lapply(reads_in_peaks_files, function(x)readLines(x))))
+
+frip_data <- data.frame(total_reads_files, total_reads, reads_in_peaks)
+frip_data$FRiP <- frip_data$reads_in_peaks/frip_data$total_reads
+frip_data$sample <- gsub("frip\\/(.*?)\\.total_reads\\.txt", "\\1", frip_data$total_reads_files)
+
+# Make combined dataframe with estimated library size, percent duplication, and FRiP
+merged_qc_metrics <- frip_data %>%
+  left_join(tss_scores, by = "sample") %>%
+  left_join(estimated_library_sizes, by = "sample") %>%
+  left_join(picard_percent_dup, by = "sample") %>%
+  select(sample, estimated_library_size, percent_duplication, total_reads, FRiP, tss_score)
+```
+
+## Summarize peaks
+Get number of peaks per sample and other measures, based on bioinformatics core pipeline. Per bioinformatics, there should be at least 10,000 peaks per sample (less means too few reads or bad data/sample prep).
+
+Define function to read peak files from MACS3 hmmratac (format of hmmratac output: https://macs3-project.github.io/MACS/docs/hmmratac.html)
+```{r define readPeaks function}
+readPeaks = function(peak_file, sample_name) {
+  peaks_ <- read.table(peak_file, header = FALSE, fill = TRUE) %>% mutate(width = abs(V3-V2))
+  colnames(peaks_)[1:10] <- c("chr", "start", "end", "name", "score", "strand", "unused1", "unused2", "unused3", "peakSummitPosition")
+  peaks_$sample <- sample_name
+  return(peaks_)
+}
+```
+
+Get list of peak files
+```{r load peak files}
+# List all hmmratac peak files
+peak_dir <- "peaks/macs2"
+peak_files <- list.files(path = peak_dir, pattern = "\\.narrowPeak$", full.names = TRUE)
+
+# Make list of peak files and sample names
+peak_sample_list <- c()
+peak_list <- list()
+for (peak_file in peak_files) {
+  sample_name <- sub("\\.MACS_accessible_regions\\.narrowPeak$", "", basename(peak_file))
+  peak_sample_list <- c(peak_sample_list, sample_name)
+  peak_data <- peak_file
+  peak_list[[sample_name]] <- peak_data
+}
+```
+
+Loop over all samples and read peak files
+```{r read peaks}
+macs3peaks <- c()
+for (name in names(peak_list)) {
+  peak_file <- peak_list[[name]]
+  sample_name <- name
+  peaks_ <- readPeaks(peak_file, sample_name)
+  macs3peaks <- rbind(macs3peaks, peaks_)
+}
+macs3peaks_filtered <- macs3peaks %>%
+  mutate(chr = gsub("chr", "", chr)) %>%
+  filter(chr %in% c(1:23, "X", "Y"))
+```
+
+Summarize peak info for each sample
+```{r summarize peaks}
+peak_summary <- macs3peaks %>%
+  group_by(sample) %>%
+  summarize(nPeaks = n(), minPeakWidth = min(width), meanPeakWidth = mean(width), medianPeakWidth = median(width), maxPeakWidth = max(width))
+```
+
+Samples with failed QC:
+- 12-Ly6CMon-TLR7-CD452: TSSe slightly below 10, FRiP < 0.2
+- 19-Ly6CMon-WT-CD4512: TSSe slightly above 10, FRiP < 0.2
+- 30-pMon-TLR7-CD452: TSSe < 10, FRiP < 0.2
+- 31-iHPC-TLR7-CD4512: TSSe slightly less than 10, peak calling failed, but FRiP and estimated library complexity look good
+- 33-Ly6CMon-TLR7-CD4512: Upside-down TSS plot(?), FRiP < 0.2, small estimated library complexity (<7e6)
+- 37-iHPC-TLR7-CD4512: FRiP < 0.2, TSSe and estimated library size look good
+- 46-pMon-TLR7-CD452: FRiP < 0.2, TSSe and estimated library size look good
+- 48-iHPC-TLR7-CD452: FRiP < 0.2, TSSe and estimated library size look good
+- 57-pMon-TLR7-CD452: FRiP < 0.2, TSSe and estimated library size look good
+- 58-iHPC-TLR7-CD4512: TSSe slightly above 10, FRiP < 0.2
+
+Samples with concerning QC metrics:
+- 16-iHPC-TLR7-CD452: TSSe slightly less than 10, FRiP and estimated library complexity look good
+- 44-Ly6CMon-TLR7-CD452: TSSe slightly less than 10, FRiP slightly above 0.2
+
+# Differential peak analysis
+
+Import sample sheet
+```{r import sample sheet}
+path_to_sample_sheet <- "blacklisted_macs2_chimera_sample_sheet.csv"
+samples <- read.csv(path_to_sample_sheet, header = TRUE)
+samples <- samples %>%
+  dplyr::select(!(MouseNumber:Mouse))
+# Remove failed samples from sample sheet
+failed_samples <- c("12-Ly6CMon-TLR7-CD452", "19-Ly6CMon-WT-CD4512", "30-pMon-TLR7-CD452", "31-iHPC-TLR7-CD4512", "33-Ly6CMon-TLR7-CD4512", "37-iHPC-TLR7-CD4512", "46-pMon-TLR7-CD452", "48-iHPC-TLR7-CD452", "57-pMon-TLR7-CD452", "58-iHPC-TLR7-CD4512")
+samples <- samples %>%
+  dplyr::filter(!grepl(paste(failed_samples, collapse = "|"), SampleID))
+# Subset Ly6CMon samples
+ly6cmon_samples <- samples %>%
+  dplyr::filter(grepl("Ly6CMon", SampleID))
+```
+
+## Prepare mouse annotations to annotate peaks
+Getting latest version of EnsDb annotation for mouse: https://support.bioconductor.org/p/9135325/
+```{r get mouse EnsDb}
+ah <- AnnotationHub()
+#EnsDb.Mmusculus <- query(ah, pattern = c("Mus musculus", "EnsDb"), "Ensembl 110")
+EnsDb.Mmusculus <- query(ah, pattern = c("Mus musculus", "EnsDb", "Ensembl 110"))
+EnsDb.Mmusculus.v111 <- EnsDb.Mmusculus[[length(EnsDb.Mmusculus)]]
+class(EnsDb.Mmusculus.v111)
+```
+
+Get and format annotations with ChIPpeakAnno
+```{r get and format annotations}
+annoData <- ChIPpeakAnno::toGRanges(EnsDb.Mmusculus.v111, feature = "gene")
+annoData <- annoData[seqnames(annoData) %in% paste0("chr", c(1:23, "X", "Y"))]
+ucsc_levels <- paste0("chr", c(1:23, "X", "Y"))
+seqlevels(annoData) <- ucsc_levels
+```
+
+Get mm39 regions to exclude from exclude ranges
+```{r get regions to exclude}
+query_data <- subset(ah, preparerclass == "excluderanges")
+mm39.excluderanges <- query_data[["AH107321"]]
+# Export as BED file
+write.table(as.data.frame(mm39.excluderanges), file = "mm39_excluderanges.bed", sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+```
+
+## Generate counts table for consensus peaks merged across all samples
+```{r generate counts table for all samples}
+#consensus_peaks <- "peaks/hmmratac/new_cutoff/blacklisted/consensus_peaks.bed"
+samples_no_allele <- samples %>%
+  mutate(Treatment = gsub("-CD45-1", "", Treatment)) %>%
+  mutate(Factor = gsub("-CD45-1", "", Factor)) %>%
+  dplyr::select(-Condition)
+diffBindObj <- dba(sampleSheet = samples_no_allele)
+# Get consensus peakset
+diffBindObj <- dba.count(diffBindObj, summits = TRUE)
+#Code for using previously-generated BED of consensus peaks: diffBindObj <- dba.count(diffBindObj, peaks = consensus_peaks, summits = TRUE)
+```
+
+Filter consensus peaks to exclude peaks that are less than 50bp or over 10000bp in width and/or only occur in one sample
+```{r filter consensus peaks}
+# Generate consensus peakset
+consensus_peakset <- dba.peakset(diffBindObj, consensus = TRUE, minOverlap = 2)
+# Filter consensus peakset to exclude peaks <50bp or >10000bp
+consensus_peakset_filtered <- dba.peakset(consensus_peakset, bRetrieve = TRUE) #Number of peaks before filtering: 69279
+consensus_peakset_filtered <- consensus_peakset_filtered[width(consensus_peakset_filtered) >= 50 & width(consensus_peakset_filtered) <= 10000] #Number of peaks after filtering: 69222
+# Make count matrix using filtered peaks
+diffBindObj <- dba.count(diffBindObj, peaks = consensus_peakset_filtered, summits = TRUE)
+```
+
+```{r plot heatmap}
+#pdf(file = "plots/exclude_irf5_tlr7/all_samples_mutation_PCA.pdf", width = 6, height = 6)
+dba.plotPCA(diffBindObj, DBA_TREATMENT)
+#dev.off()
+```
+
+Make PCA with only TLR7/TLR7 iHPCs, TLR7/TLR Ly6CHi monocytes, TLR7/TLR7 patrolling monocytes, and TLR7/IRF5ko Ly6CHi monocytes
+```{r}
+# Remove samples that don't fall into categories for PCA
+IRF5ko_chimera_samples <- c("6-Ly6CMon-TLR7-CD4512", "7-Ly6CMon-TLR7-IRF5ko-CD452", "10-iHPC-TLR7-CD4512", "17-Ly6CMon-TLR7-CD4512", "18-Ly6CMon-TLR7-IRF5ko-CD452", "21-iHPC-TLR7-CD4512", "22-Ly6CMon-TLR7-CD4512", "19-pMon-TLR7-CD4512", "20-pMon-TLR7-IRF5ko-CD452", "35-pMon-TLR7-CD4512", "36-pMon-TLR7-IRF5ko-CD452", "26-iHPC-TLR7-CD4512", "34-Ly6CMon-TLR7-IRF5ko-CD452", "39-Ly6CMon-TLR7-IRF5ko-CD452", "41-pMon-TLR7-IRF5ko-CD452", "42-iHPC-TLR7-CD4512", "49-Ly6CMon-TLR7-CD4512", "50-Ly6CMon-TLR7-IRF5ko-CD452", "53-iHPC-TLR7-CD4512", "1-Ly6CMon-WT-CD4512", "2-Ly6CMon-IRF5ko-CD452", "8-Ly6CMon-IRF5ko-CD452", "13-Ly6CMon-WT-CD4512", "25-Ly6CMon-WT-CD4512", "26-Ly6CMon-IRF5ko-CD452")
+samples_noIRF5ko <- samples %>%
+  dplyr::filter(!grepl(paste(IRF5ko_chimera_samples, collapse = "|"), SampleID))
+diffBindObj_noIRF5ko <- dba(sampleSheet = samples_noIRF5ko)
+diffBindObj_noIRF5ko <- dba.count(diffBindObj_noIRF5ko, summits = TRUE)
+# Generate consensus peakset
+consensus_peakset_noIRF5ko <- dba.peakset(diffBindObj_noIRF5ko, consensus = TRUE, minOverlap = 2)
+# Filter consensus peakset to exclude peaks <50bp or >10000bp
+consensus_peakset_noIRF5ko_filtered <- dba.peakset(consensus_peakset_noIRF5ko, bRetrieve = TRUE) #Number of peaks before filtering: 60052
+consensus_peakset_noIRF5ko_filtered <- consensus_peakset_noIRF5ko_filtered[width(consensus_peakset_noIRF5ko_filtered) >= 50 & width(consensus_peakset_noIRF5ko_filtered) <= 10000] #Number of peaks after filtering: 60052 (no peaks were filtered?)
+# Make count matrix using filtered peaks
+diffBindObj_noIRF5ko <- dba.count(diffBindObj_noIRF5ko, peaks = consensus_peakset_noIRF5ko_filtered, summits = TRUE)
+# Plot PCA
+pdf(file = "plots/exclude_irf5_tlr7/noIRF5ko_samples_cellType_PCA.pdf", width = 6, height = 6)
+dba.plotPCA(diffBindObj_noIRF5ko, DBA_TISSUE)
+dev.off()
+``` 
+
+Normalize all data
+```{r normalize all data}
+# Normalize data
+diffBindObj_norm <- dba.normalize(diffBindObj, method = DBA_DESEQ2, normalize = DBA_NORM_RLE)
+```
+
+Extract count matrix and filter out peaks with <10 reads in a sample and <100 reads across all samples
+```{r filter peaks}
+# Get count matrix
+binding_matrix <- dba.peakset(diffBindObj, bRetrieve = TRUE, DataType = DBA_DATA_FRAME)
+count_matrix <- binding_matrix[, 5:ncol(binding_matrix)]
+# Find peaks that meet criteria
+keep_peaks <- apply(count_matrix, 1, function(row){
+  any_above_10 <- any(row >= 10)
+  sum_above_100 <- sum(row) >= 100
+  return(any_above_10 & sum_above_100)
+})
+# Filter DiffBind object
+filteredDiffBindObject <- dba.peakset(diffBindObj, bRetrieve = FALSE, mask = keep_peaks)
+```
+
+```{r}
+# Get count matrix
+peaks <- dba.peakset(diffBindObj, bRetrieve = TRUE, score = DBA_SCORE_READS)
+count_matrix <- as.matrix(mcols(peaks))
+# Find peaks that meet criteria
+keep_peaks <- apply(count_matrix, 1, function(row){
+  any_above_10 <- any(row >= 10)
+  sum_above_100 <- sum(row) >= 100
+  return(any_above_10 & sum_above_100)
+})
+# Filter peaks
+filtered_peaks <- peaks[keep_peaks]
+# Create new DBA object using filtered peakset
+filteredDiffBindObj <- dba(sampleSheet = samples_no_allele)
+filteredDiffBindObj <- dba.count(filteredDiffBindObj, peaks = filtered_peaks, summits = TRUE)
+```
+
+Subset object to only Ly6CHi monocytes and set up contrast between TLR7 vs WT, normalize
+```{r set up contrast for TLR7 vs WT Ly6CHi monocytes and normalize}
+# Subset count matrix to only TLR7 or B6 Ly6CHi monocytes
+tlr7_b6_ly6cmon_mask <- diffBindObj$samples$Tissue == "Ly6CMon" & diffBindObj$samples$Treatment %in% c("TLR7", "B6")
+tlr7_b6_ly6cmon_dba <- dba(diffBindObj, mask = tlr7_b6_ly6cmon_mask)
+# Filter out peaks with score <10 RPKM
+tlr7_b6_ly6cmon_filtered_dba <- dba.count(tlr7_b6_ly6cmon_dba, filter = 10, filterFun = max)
+# Set up contrasts
+tlr7_b6_ly6cmon_dba <- dba.contrast(tlr7_b6_ly6cmon_dba, categories = DBA_TREATMENT, block = c(DBA_REPLICATE, DBA_CONDITION), reorderMeta = list(Treatment = "B6"))
+# Normalize data
+tlr7_b6_ly6cmon_dba <- dba.normalize(tlr7_b6_ly6cmon_dba, method = DBA_DESEQ2, normalize = DBA_NORM_RLE)
+```
+
+Make MA plot of non-normalized data
+```{r plot non-normalized data}
+dba.plotMA(tlr7_b6_ly6cmon_dba, bNormalized = FALSE, sub = "Non-Normalized",
+           contrast = list(TLR7 = tlr7_b6_ly6cmon_dba$masks$TLR7,
+                           B6 = tlr7_b6_ly6cmon_dba$masks$B6))
+```
+
+Make MA plot of normalized data
+```{r plot normalized data}
+dba.plotMA(tlr7_b6_ly6cmon_dba, sub = "Normalized",
+           contrast = list(TLR7 = tlr7_b6_ly6cmon_dba$masks$TLR7,
+                           B6 = tlr7_b6_ly6cmon_dba$masks$B6))
+```
+
+Perform differential binding analysis
+```{r differential binding analysis}
+tlr7_b6_ly6cmon_dba <- dba.analyze(tlr7_b6_ly6cmon_dba, method = DBA_DESEQ2)
+saveRDS(tlr7_b6_ly6cmon_dba, file = "20250923_tlr7_b6_ly6cmon_dba.rds")
+dba.show(tlr7_b6_ly6cmon_dba, bContrast = TRUE)
+```
+
+Make volcano plot to check differential peaks
+```{r differential peak volcano plot}
+dba.plotVolcano(tlr7_b6_ly6cmon_dba)
+```
+
+## Get consensus peaks per tissue/treatment combination
+
+Get consensus peaks per tissue/treatment
+```{r get condition-specific consensus peaks}
+tissue_treatment_diffBindObj <- dba(sampleSheet = samples_no_allele)
+tissue_treatment_consensus_peaks <- dba.peakset(tissue_treatment_diffBindObj, consensus = c(-DBA_REPLICATE), minOverlap = 0.66)
+# Convert peaks to GRanges object and filter out peaks less than 50bp or more than 10000bp
+tissue_treatment_consensus_peaks_gr <- tissue_treatment_consensus_peaks$peaks
+tissue_treatment_filtered_peaks <- lapply(tissue_treatment_consensus_peaks_gr, function(gr) {
+  gr[width(gr) >= 50 & width(gr) <= 10000]
+})
+tissue_treatment_filtered_peaks_gr <- GRangesList(tissue_treatment_filtered_peaks)
+tissue_treatment_consensus_peaks$peaks <- tissue_treatment_filtered_peaks_gr
+tissue_treatment_consensus_dba <- dba(tissue_treatment_consensus_peaks, mask = tissue_treatment_consensus_peaks$masks$Consensus, minOverlap = 2)
+tissue_treatment_consensus_dba
+```
+
+Export tissue/treatment consensus peak sets as BED files
+```{r export BED files}
+for (i in seq_along(tissue_treatment_consensus_dba$peaks)) {
+  # Get the peakset data frame
+  peakset_df <- tissue_treatment_consensus_dba$peaks[[i]]
+  
+  # Ensure it has at least the first 3 columns: chr, start, end
+  bed_df <- peakset_df[, 1:3]
+  
+  # Define the output file name
+  file_name <- paste0("peaks/diffbind_consensus_peaksets/consensus_peakset_", i, ".bed")
+  
+  # Write to BED file (no quotes, no row names, no column names)
+  write.table(bed_df, file = file_name, sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+}
+```
+
+## Ly6CHI monocytes
+
+### Check if samples cluster by allele
+Count reads overlapping Ly6CHI monocyte consensus peaks
+```{r dba count}
+ly6cmon_consensus_peaks_file <- "peaks/hmmratac/LyCMon.MACS_accessible_regions.narrowPeak"
+consensus_peaks_ly6cmon <- dba(sampleSheet=ly6cmon_samples)
+#consensus_peaks_ly6cmon <- dba.peakset(consensus_peaks_ly6cmon, bRetrieve = TRUE)
+consensus_peaks_ly6cmon_counts <- dba.count(consensus_peaks_ly6cmon, summits = TRUE)
+```
+
+```{r heatmap}
+plot(consensus_peaks_ly6cmon_counts)
+```
+
+```{r PCA}
+dba.plotPCA(consensus_peaks_ly6cmon_counts, DBA_TREATMENT)
+```
+
+### Perform differential binding analysis on TLR7+IRF5ko vs. TLR7+ Ly6CHI monocytes and TLR7+ vs. WT (B6) Ly6CHI monocytes
+
+#### TLR7+IRF5ko vs. TLR7+ Ly6CHI monocytes
+
+```{r TLR7+ TLR7+IRF5ko Ly6CHI mon consensus peaks}
+# Edit sample sheet to include only TLR7+ and TLR7+IRF5ko samples and remove CD45-1 allele from treatment column
+tlr7_ly6cmon_samples <- ly6cmon_samples %>%
+  mutate(Treatment = gsub("-CD45-1", "", Treatment)) %>%
+  mutate(Factor = gsub("-CD45-1", "", Factor)) %>%
+  dplyr::filter(Factor == "TLR7-IRF5ko_TLR7")
+#  dplyr::filter(Treatment == "TLR7" | Treatment == "TLR7-IRF5ko")
+tlr7_ly6cmon_dba <- dba(sampleSheet=tlr7_ly6cmon_samples)
+# Generate consensus peakset
+tlr7_ly6cmon_consensus_peakset <- dba.peakset(tlr7_ly6cmon_dba, consensus = TRUE, minOverlap = 2)
+# Filter consensus peakset to exclude peaks <50bp or >10000bp
+tlr7_ly6cmon_filtered_consensus_peakset <- dba.peakset(tlr7_ly6cmon_consensus_peakset, bRetrieve = TRUE) #Number of peaks before filtering: 52298
+tlr7_ly6cmon_filtered_consensus_peakset <- tlr7_ly6cmon_filtered_consensus_peakset[width(tlr7_ly6cmon_filtered_consensus_peakset) >= 50 & width(tlr7_ly6cmon_filtered_consensus_peakset) <= 10000] #Number of peaks after filtering: 52263
+# Make count matrix using filtered peaks
+consensus_peaks_tlr7_ly6cmon_counts <- dba.count(tlr7_ly6cmon_dba, peaks = tlr7_ly6cmon_filtered_consensus_peakset, summits = TRUE)
+dba.plotPCA(consensus_peaks_tlr7_ly6cmon_counts, DBA_TREATMENT)
+```
+
+Make MA plot of non-normalized data (using total aligned reads in BAM files)
+```{r MA plot}
+dba.plotMA(consensus_peaks_tlr7_ly6cmon_counts, bNormalized = FALSE, sub = "Non-Normalized",
+           contrast = list(`TLR7-IRF5ko` = consensus_peaks_tlr7_ly6cmon_counts$masks$`TLR7-IRF5ko`,
+                           TLR7 = consensus_peaks_tlr7_ly6cmon_counts$masks$TLR7))
+```
+
+Establish contrasts to be tested against the model
+```{r establish contrasts}
+tlr7_ly6cmon_model <- dba.contrast(consensus_peaks_tlr7_ly6cmon_counts, categories = DBA_TREATMENT, block = c(DBA_REPLICATE, DBA_CONDITION), reorderMeta = list(Treatment = "TLR7"))
+tlr7_ly6cmon_model
+```
+
+Normalize dataset
+```{r normalize}
+tlr7_ly6cmon_model_norm <- dba.normalize(tlr7_ly6cmon_model, method = DBA_ALL_METHODS, library = DBA_LIBSIZE_FULL, normalize = DBA_NORM_LIB, background = FALSE)
+tlr7_ly6cmon_model_norm
+```
+
+Make MA plot of normalized data
+```{r MA plot}
+dba.plotMA(tlr7_ly6cmon_model_norm, sub = "Normalized (Default)",
+           contrast = list(`TLR7-IRF5ko` = consensus_peaks_tlr7_ly6cmon_counts$masks$`TLR7-IRF5ko`,
+                           TLR7 = consensus_peaks_tlr7_ly6cmon_counts$masks$TLR7))
+```
+
+Fit model and apply tests for the contrast
+```{r fitting and testing}
+tlr7_ly6cmon_model_norm <- dba.analyze(tlr7_ly6cmon_model_norm)
+dba.show(tlr7_ly6cmon_model_norm, bContrasts = TRUE)
+```
+
+Make volcano plot with differential binding sites
+```{r differential site volcano plot}
+dba.plotVolcano(tlr7_ly6cmon_model_norm)
+```
+
+Make heatmap based on differential binding sites
+```{r differential site heatmap}
+plot(tlr7_ly6cmon_model_norm, contrast = 1)
+```
+
+Get consensus peak set and annotate peaks to promoters and gene bodies
+```{r annotate peaks}
+# Prepare peaks for annotation
+tlr7_ly6cmon_peaklist <- dba.peakset(tlr7_ly6cmon_model_norm, bRetrieve = T, DataType = DBA_DATA_FRAME)
+filterChr <- c("chr1", "chr2", "chr3", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chrX", "chrY")
+tlr7_ly6cmon_peak_bed <- tlr7_ly6cmon_peaklist %>%
+  dplyr::filter(START >= 0, CHR %in% filterChr) %>%
+  dplyr::select(CHR, START, END)
+options(scipen = 999)
+write.table(tlr7_ly6cmon_peak_bed, file = "differential_peaks/exclude_irf5_tlr7/great_bed_files/TLR7IRF5ko-TLR7-Ly6CMon_consensus_peaks.bed", quote = FALSE, sep = "\t", row.names = FALSE, col.names = FALSE) # Export consensus peaks BED as background for GREAT
+tlr7_ly6cmon_peaklist$peakID <- 1:nrow(tlr7_ly6cmon_peaklist)
+tlr7_ly6cmon_peaklist.g <- GRanges(seqnames = tlr7_ly6cmon_peaklist$CHR, 
+                           IRanges(start = tlr7_ly6cmon_peaklist$START, 
+                                   end = tlr7_ly6cmon_peaklist$END), 
+                           strand = "*", 
+                           peakID = tlr7_ly6cmon_peaklist$peakID)
+seqlevelsStyle(tlr7_ly6cmon_peaklist.g) <- "UCSC"
+tlr7_ly6cmon_peaklist.g <- tlr7_ly6cmon_peaklist.g[seqnames(tlr7_ly6cmon_peaklist.g) %in% paste0("chr", c(1:23, "X", "Y"))]
+seqlevels(tlr7_ly6cmon_peaklist.g) <- ucsc_levels
+seqlevelsStyle(tlr7_ly6cmon_peaklist.g) <- "NCBI"
+seqlevels(tlr7_ly6cmon_peaklist.g)
+
+# Annotate closest gene bodies
+tlr7_ly6cmon_geneBodies.g <- ChIPpeakAnno::annotatePeakInBatch(tlr7_ly6cmon_peaklist.g,
+                                                               AnnotationData = annoData,
+                                                               output = "nearestLocation",
+                                                               select = "first")
+tlr7_ly6cmon_geneBodies.g <- ChIPpeakAnno::addGeneIDs(tlr7_ly6cmon_geneBodies.g, orgAnn = "org.Mm.eg.db", IDs2Add = c("symbol"))
+tlr7_ly6cmon_nearestGeneBodies <- data.frame(peakID = tlr7_ly6cmon_geneBodies.g$peakID, 
+                                             closestGene = tlr7_ly6cmon_geneBodies.g$symbol, 
+                                             distanceToGene = tlr7_ly6cmon_geneBodies.g$distancetoFeature, 
+                                             closestGeneENS = tlr7_ly6cmon_geneBodies.g$feature)
+
+# Now, all promoters within +/- 10 000 bp (one to many)
+seqlevelsStyle(tlr7_ly6cmon_peaklist.g) <- "UCSC"
+tlr7_ly6cmon_nearPromoters.g <- ChIPpeakAnno::annotatePeakInBatch(tlr7_ly6cmon_peaklist.g, 
+                                                                 AnnotationData = annoData, 
+                                                                 output = "nearestBiDirectionalPromoters",
+                                                                 bindingRegion = c(-10000, 10000),
+                                                                 select = "all")
+tlr7_ly6cmon_nearPromoters.g <- ChIPpeakAnno::addGeneIDs(tlr7_ly6cmon_nearPromoters.g, orgAnn = "org.Mm.eg.db", IDs2Add = c("symbol"))
+tlr7_ly6cmon_nearPromoters <- data.frame(peakID = tlr7_ly6cmon_nearPromoters.g$peakID,
+                                         distanceToPromoter = tlr7_ly6cmon_nearPromoters.g$distanceToSite,
+                                         promoterSymbol = tlr7_ly6cmon_nearPromoters.g$gene_name,
+                                         promoterENS = tlr7_ly6cmon_nearPromoters.g$feature)
+
+# All peaks that weren't annotated, we are now going to find, and then look for the one closest promoter within 100 000 bp (one to one)
+tlr7_ly6cmon_missingPeakIDs <- setdiff(tlr7_ly6cmon_peaklist.g$peakID, tlr7_ly6cmon_nearPromoters.g$peakID)
+tlr7_ly6cmon_missingPeaks.g <- tlr7_ly6cmon_peaklist.g[tlr7_ly6cmon_peaklist.g$peakID %in% tlr7_ly6cmon_missingPeakIDs]
+tlr7_ly6cmon_farPromoters.g <- ChIPpeakAnno::annotatePeakInBatch(tlr7_ly6cmon_missingPeaks.g,
+                                                                 AnnotationData = annoData,
+                                                                 output = "nearestBiDirectionalPromoters", 
+                                                                 bindingRegion = c(-100000, 100000),
+                                                                 select = "all")
+tlr7_ly6cmon_farPromoters <- data.frame(peakID = tlr7_ly6cmon_farPromoters.g$peakID,
+                                        distanceToPromoter = tlr7_ly6cmon_farPromoters.g$distanceToSite,
+                                        promoterSymbol = tlr7_ly6cmon_farPromoters.g$gene_name,
+                                        promoterENS = tlr7_ly6cmon_farPromoters.g$feature)
+tlr7_ly6cmon_promoters <- rbind(tlr7_ly6cmon_nearPromoters, tlr7_ly6cmon_farPromoters)
+tlr7_ly6cmon_promoters <- dplyr::distinct(tlr7_ly6cmon_promoters)
+```
+
+Process contrasts
+```{r process contrasts}
+tlr7_ly6cmon_contrasts <- dba.show(tlr7_ly6cmon_model_norm, bContrast = TRUE)
+tlr7_ly6cmon_contrasts <- dplyr::mutate(tlr7_ly6cmon_contrasts, name = paste0(Group, "_vs_", Group2))
+dge_tlr7_ly6cmon <- c()
+for (iContrast in 1:nrow(tlr7_ly6cmon_contrasts)) {
+  dge_ <- dba.report(tlr7_ly6cmon_model_norm, method = DBA_DESEQ2, contrast = iContrast, th = 1, DataType = DBA_DATA_FRAME)
+  dge_$peakID = as.numeric(rownames(dge_))
+  dge_ <- merge(dge_, tlr7_ly6cmon_nearestGeneBodies, by = "peakID", all.x = TRUE, no.dups = FALSE)
+  dge_ <- left_join(dge_, tlr7_ly6cmon_promoters, by = "peakID", keep = FALSE)
+  dge_$peakPosition <- paste0(dge_$Chr, ":", dge_$Start, "-", dge_$End)
+  dge_ <- dplyr::arrange(dge_, FDR) %>%
+    dplyr::filter(Chr %in% filterChr)
+  dge_tlr7_ly6cmon[[iContrast]] <- dge_
+}
+names(dge_tlr7_ly6cmon) <- tlr7_ly6cmon_contrasts$name
+```
+
+Export differential peaks
+```{r export differential peaks}
+for (contrast in names(dge_tlr7_ly6cmon)) {
+  dge_ <- dge_tlr7_ly6cmon[[contrast]]
+  out <- dge_ %>%
+    dplyr::filter(FDR < 0.05) %>%
+    dplyr::select(peakPosition, Fold, `p-value`, FDR, 
+                  promoterSymbol, promoterENS, distanceToPromoter, 
+                  closestGene, closestGeneENS, distanceToGene) %>%
+    dplyr::rename(logFC = Fold)
+  write.table(out, file = paste0("differential_peaks/exclude_irf5_tlr7/TLR7IRF5ko-TLR7-Ly6CMon_differential_peaks_annotated.csv"), sep = ",", quote = FALSE, row.names = FALSE)
+  bed <- dge_ %>%
+    dplyr::filter(FDR < 0.05) %>%
+    dplyr::select(Chr, Start, End)
+  bed <- distinct(bed)
+  bed$peakID <- 1:nrow(bed)
+  bed$blank <- "1"
+  bed$strand <- "+"
+  write.table(dplyr::select(bed, peakID, Chr, Start, End, strand), file = "differential_peaks/exclude_irf5_tlr7/TLR7IRF5ko-TLR7-Ly6CMon_differential_peaks.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  # Export minimal BED file of differential peaks for GREAT
+  minimal_bed <- bed %>%
+    dplyr::filter(Start >= 0, Chr %in% filterChr) %>%
+    dplyr::select(Chr, Start, End)
+  write.table(minimal_bed, file = "differential_peaks/exclude_irf5_tlr7/great_bed_files/TLR7IRF5ko-TLR7-Ly6CMon_differential_peaks.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  # Export BED file for peaks that are significantly more accessible (i.e. upregulated)
+  upregulated_bed <- dge_ %>%
+    dplyr::filter(FDR < 0.05 & Fold > 1) %>%
+    dplyr::select(Chr, Start, End)
+  write.table(upregulated_bed, file = "differential_peaks/exclude_irf5_tlr7/homer_bed_files/TLR7IRF5ko-TLR7-Ly6CMon_upregulated_peaks.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  # Export BED file for peaks that are significantly less accessible (i.e. downregulated)
+  downregulated_bed <- dge_ %>%
+    dplyr::filter(FDR < 0.05 & Fold < -1) %>%
+    dplyr::select(Chr, Start, End)
+  write.table(downregulated_bed, file = "differential_peaks/exclude_irf5_tlr7/homer_bed_files/TLR7IRF5ko-TLR7-Ly6CMon_downregulated_peaks.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+}
+```
+
+Find top hits
+```{r find top hits}
+tlr7_ly6cmon_top_hits <- dge_tlr7_ly6cmon[[1]] %>%
+  arrange(log10(FDR)) %>%
+  group_by(sign(Fold)) %>%
+  slice_head(n = 15)
+tlr7_ly6cmon_top_hits
+```
+
+Categorize hits and make volcano plot annotated with nearest genes
+```{r nearest gene volcano plot}
+dge_tlr7_ly6cmon_reg <- dge_tlr7_ly6cmon[[1]] %>%
+  mutate(regulation = case_when(
+    Fold > 1 & `FDR`< 0.05 ~ "up",
+    Fold < -1 & `FDR`< 0.05 ~ "down",
+    TRUE ~ "unaffected"
+  ))
+
+#pdf(file = "plots/exclude_irf5_tlr7/TLR7IRF5ko-TLR7-Ly6CMon_genes_volcano.pdf", width = 8, height = 8)
+ggplot(data = dge_tlr7_ly6cmon_reg, aes(x = Fold, y = -log10(`FDR`), color = regulation)) +
+  geom_point(alpha=0.7, size=2.5, shape = 19) +
+  geom_text_repel(data = . %>%
+    mutate(label = ifelse(peakID %in% tlr7_ly6cmon_top_hits$peakID, closestGene, "")),
+    aes(label = label), color = "black", size = 3.5, segment.color = "black", segment.size = 0.4, box.padding = 0.75, force = 10, max.overlaps = Inf, show.legend = FALSE) +
+  scale_color_manual(values = c("#2166AC", "#E6E6E6", "#B2182B"),
+    labels = c("Up in TLR7.1 monocytes", "Not significant", "Up in TLR7.1 IRF5-/- monocytes")) +
+  geom_vline(xintercept = c(-1, 1), color = "black", linetype = "dotted", linewidth = 0.3) +
+  geom_hline(yintercept = -log10(0.05), color = "black", linetype = "dotted", linewidth = 0.3) +
+  labs(title = "TLR7.1 IRF5-/- vs. TLR7.1 monocytes", subtitle = "Peaks labeled by nearest gene", color = "", x = expression("log"[2]*"FC"), y = expression("-log"[10]*"FDR")) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+#dev.off()
+```
+
+Make volcano plot annotated with nearest promoters
+```{r nearest promoter volcano plot}
+#pdf(file = "plots/exclude_irf5_tlr7/TLR7IRF5ko-TLR7-Ly6CMon_promoters_volcano.pdf", width = 8, height = 8)
+ggplot(data = dge_tlr7_ly6cmon_reg, aes(x = Fold, y = -log10(`FDR`), color = regulation)) +
+  geom_point(alpha=0.7, size=2.5, shape = 19) +
+  geom_text_repel(data = . %>%
+    mutate(label = ifelse(peakID %in% tlr7_ly6cmon_top_hits$peakID, promoterSymbol, "")),
+    aes(label = label), color = "black", size = 3.5, segment.color = "black", segment.size = 0.4, box.padding = 0.75, force = 10, max.overlaps = Inf, show.legend = FALSE) +
+  scale_color_manual(values = c("#2166AC", "#E6E6E6", "#B2182B"),
+                     labels = c("Up in TLR7.1 monocytes", "Not significant", "Up in TLR7.1 IRF5-/- monocytes")) +
+  geom_vline(xintercept = c(-1, 1), color = "black", linetype = "dotted", linewidth = 0.3) +
+  geom_hline(yintercept = -log10(0.05), color = "black", linetype = "dotted", linewidth = 0.3) +
+  labs(title = "TLR7.1 IRF5-/- vs. TLR7.1 monocytes", subtitle = "Peaks labeled by nearest promoter", color = "", x = expression("log"[2]*"FC"), y = expression("-log"[10]*"FDR")) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+#dev.off()
+```
+
+Make volcano plot without peak annotations
+```{r nearest promoter volcano plot}
+#pdf(file = "plots/exclude_irf5_tlr7/TLR7IRF5ko-TLR7-Ly6CMon_volcano.pdf", width = 8, height = 8)
+ggplot(data = dge_tlr7_ly6cmon_reg, aes(x = Fold, y = -log10(`FDR`), color = regulation)) +
+  geom_point(alpha=0.7, size=2.5, shape = 19) +
+  scale_color_manual(values = c("#2166AC", "#E6E6E6", "#B2182B"),
+                     labels = c("Up in TLR7.1 monocytes", "Not significant", "Up in TLR7.1 IRF5-/- monocytes")) +
+  geom_vline(xintercept = c(-1, 1), color = "black", linetype = "dotted", linewidth = 0.3) +
+  geom_hline(yintercept = -log10(0.05), color = "black", linetype = "dotted", linewidth = 0.3) +
+  labs(title = "TLR7.1 IRF5-/- vs. TLR7.1 monocytes", color = "", x = expression("log"[2]*"FC"), y = expression("-log"[10]*"FDR")) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+#dev.off()
+```
+
+Determine how many peaks are more, less, or not differentially accessible
+```{r peak counts}
+dge_peaks_only_tlr7_ly6cmon <- dge_tlr7_ly6cmon_reg[, !(names(dge_tlr7_ly6cmon_reg) %in% c("closestGene", "distanceToGene", "closestGeneENS", "distanceToPromoter", "promoterSymbol", "promoterENS"))]
+dge_peaks_only_tlr7_ly6cmon <- unique(dge_peaks_only_tlr7_ly6cmon)
+table(dge_peaks_only_tlr7_ly6cmon$regulation)
+```
+
+Correlate DARs with DEG data from RNAseq
+```{r correlate DAR DEG data}
+# Import RNAseq DEG data and filter to only significant DEGs (FDR/adjp < 0.05 and 2-fold change)
+rnaseq_tlr7_ly6cmon <- read.csv("rnaseq_degs/DEgenes_Ly6ChiMono_TLR7.1_IRF5ko - Ly6ChiMono_TLR7.1.csv")
+rnaseq_tlr7_ly6cmon_significant <- rnaseq_tlr7_ly6cmon #%>%
+#  dplyr::filter(adj.P.Val <= 0.05) %>%
+#  dplyr::filter(abs(log2FC) >= 1)
+# Calculate maximum log2FC for DEGs with multiple log2FC
+rnaseq_tlr7_ly6cmon_maxlog2FC <- rnaseq_tlr7_ly6cmon_significant %>%
+  group_by(gene) %>%
+  summarize(max_rnaseq_log2FC = max(log2FC, na.rm = TRUE))
+# Retain only significant DARs in DAR dataframe (FDR/adjp < 0.05)
+atac_tlr7_ly6cmon_significant <- dge_tlr7_ly6cmon_reg %>%
+  dplyr::filter(FDR <= 0.05)
+# Calculate average log2FC for genes near multiple DARs and set FC cutoff to 2
+atac_tlr7_ly6cmon_meanlog2FC <- atac_tlr7_ly6cmon_significant %>%
+  group_by(closestGene) %>%
+  summarize(mean_atac_log2FC = mean(Fold, na.rm = TRUE)) %>%
+  dplyr::filter(!is.na(closestGene)) %>%
+  dplyr::rename(gene = closestGene) %>%
+  dplyr::filter(abs(mean_atac_log2FC) >= 1)
+# Merge DEG and DAR log2FC dataframes and categorize based on quadrant
+merged_rnaseq_atac_tlr7_ly6cmon <- left_join(rnaseq_tlr7_ly6cmon_maxlog2FC, atac_tlr7_ly6cmon_meanlog2FC, by = "gene")
+merged_rnaseq_atac_tlr7_ly6cmon$quadrant <- ifelse(merged_rnaseq_atac_tlr7_ly6cmon$mean_atac_log2FC > 0 & merged_rnaseq_atac_tlr7_ly6cmon$max_rnaseq_log2FC > 0, "I", 
+                                                        ifelse(merged_rnaseq_atac_tlr7_ly6cmon$mean_atac_log2FC <= 0 & merged_rnaseq_atac_tlr7_ly6cmon$max_rnaseq_log2FC > 0, "II", 
+                                                               ifelse(merged_rnaseq_atac_tlr7_ly6cmon$mean_atac_log2FC <= 0 & merged_rnaseq_atac_tlr7_ly6cmon$max_rnaseq_log2FC <= 0, "III",
+                                                                      "IV")))
+# Plot DEG vs. DAR log2FC
+ggplot(data = merged_rnaseq_atac_tlr7_ly6cmon, aes(x = mean_atac_log2FC, y = max_rnaseq_log2FC, color = quadrant)) +
+  geom_point(show.legend = FALSE) +
+  geom_vline(xintercept = 0, color = "gray", linetype = "dashed") +
+  geom_hline(yintercept = 0, color = "gray", linetype = "dashed") +
+  labs(title = "TLR7+IRF5ko vs. TLR7+ Ly6CHI monocytes", color = "", x = expression("ATAC-seq log"[2]*"FC"), y = expression("RNAseq log"[2]*"FC")) +
+  theme_classic()
+```
+
+##### Generate TF correlation matrix
+
+Import full collection of mouse TF PWMs from HOCOMOCO
+```{r import TF PWMs}
+# Load MEME file downloaded from HOCOMOCO
+tf_motifs <- read_meme("HOCOMOCOv11_full_MOUSE_mono_meme_format.meme")
+# Convert to PFMatrixList for use with motifmatchr
+pfm_list_prep <- lapply(tf_motifs, function(m) {
+  new("PFMatrix",
+      ID = m@name,
+      name = m@name,
+      matrixClass = "PFM",
+      strand = "+",
+      tags = list(),
+      profileMatrix = m@motif)
+})
+pfm_list <- PFMatrixList(pfm_list_prep)
+```
+
+Prepare counts RangedSummarizedExperiment object as input for chromVAR
+```{r prepare counts matrix}
+# Get raw counts matrix from dba.count()
+raw_counts_dba_tlr7_ly6cmon <- dba(sampleSheet = tlr7_ly6cmon_samples)
+raw_counts_dba_tlr7_ly6cmon <- dba.count(raw_counts_dba_tlr7_ly6cmon, summits = TRUE)
+raw_counts_dba_tlr7_ly6cmon <- dba.count(raw_counts_dba_tlr7_ly6cmon, peaks = NULL, score = DBA_SCORE_READS)
+raw_counts_matrix_tlr7_ly6cmon <- dba.peakset(raw_counts_dba_tlr7_ly6cmon, bRetrieve = TRUE, DataType = DBA_DATA_FRAME)
+# Get peak GRanges and raw counts objects
+peaks_granges_tlr7_ly6cmon <- makeGRangesFromDataFrame(raw_counts_matrix_tlr7_ly6cmon[, 1:3])
+raw_counts_data_tlr7_ly6cmon <- raw_counts_matrix_tlr7_ly6cmon[, 4:ncol(raw_counts_matrix_tlr7_ly6cmon)]
+# Create RangedSummarizedExperiment object as input for chromVAR and add depth column to sample metadata
+se_object_tlr7_ly6cmon <- SummarizedExperiment(
+  assays = list(counts = as.matrix(raw_counts_data_tlr7_ly6cmon)),
+  rowRanges = peaks_granges_tlr7_ly6cmon
+)
+total_depth_tlr7_ly6cmon <- colSums(assay(se_object_tlr7_ly6cmon, "counts"))
+colData(se_object_tlr7_ly6cmon)$depth <- total_depth_tlr7_ly6cmon
+# Add GC bias for determining background peaks
+se_object_gc_tlr7_ly6cmon <- addGCBias(se_object_tlr7_ly6cmon, genome = BSgenome.Mmusculus.UCSC.mm39)
+```
+
+#### TLR7+ vs. WT Ly6CHI monocytes
+
+```{r TLR7+ vs WT Ly6CHI mon consensus peaks}
+# Edit sample sheet to include only TLR7+ and WT samples and remove CD45-1 allele from treatment column
+wt_tlr7_ly6cmon_samples <- ly6cmon_samples %>%
+  mutate(Treatment = gsub("-CD45-1", "", Treatment)) %>%
+  dplyr::filter(Treatment == "TLR7" | Treatment == "B6")
+wt_tlr7_ly6cmon_dba <- dba(sampleSheet=wt_tlr7_ly6cmon_samples)
+# Generate consensus peakset
+wt_tlr7_consensus_peakset <- dba.peakset(wt_tlr7_ly6cmon_dba, consensus = TRUE, minOverlap = 2)
+# Filter consensus peakset to exclude peaks <50bp or >10000bp
+wt_tlr7_filtered_consensus_peakset <- dba.peakset(wt_tlr7_consensus_peakset, bRetrieve = TRUE) #Number of peaks before filtering: 51755
+wt_tlr7_filtered_consensus_peakset <- wt_tlr7_filtered_consensus_peakset[width(wt_tlr7_filtered_consensus_peakset) >= 50 & width(wt_tlr7_filtered_consensus_peakset) <= 10000] #Number of peaks after filtering: 51712
+# Make count matrix using filtered peaks
+consensus_peaks_wt_tlr7_ly6cmon_counts <- dba.count(wt_tlr7_ly6cmon_dba, peaks = wt_tlr7_filtered_consensus_peakset, summits = TRUE)
+#Old code for calculating consensus peaks w/o filtering: consensus_peaks_wt_tlr7_ly6cmon_counts <- dba.count(consensus_peaks_wt_tlr7_ly6cmon, summits = TRUE)
+dba.plotPCA(consensus_peaks_wt_tlr7_ly6cmon_counts, DBA_TREATMENT)
+```
+
+Make MA plot of non-normalized data (using total aligned reads in BAM files)
+```{r MA plot}
+dba.plotMA(consensus_peaks_wt_tlr7_ly6cmon_counts, bNormalized = FALSE, sub = "Non-Normalized",
+           contrast = list(TLR7 = consensus_peaks_wt_tlr7_ly6cmon_counts$masks$TLR7,
+                           B6 = consensus_peaks_wt_tlr7_ly6cmon_counts$masks$B6))
+```
+
+Establish contrasts to be tested against the model
+```{r establish contrasts}
+wt_tlr7_ly6cmon_model <- dba.contrast(consensus_peaks_wt_tlr7_ly6cmon_counts, categories = DBA_TREATMENT, block = c(DBA_REPLICATE, DBA_CONDITION), reorderMeta = list(Treatment = "B6"))
+wt_tlr7_ly6cmon_model
+```
+
+Normalize dataset
+```{r normalize}
+wt_tlr7_ly6cmon_model_norm <- dba.normalize(wt_tlr7_ly6cmon_model, method = DBA_ALL_METHODS, library = DBA_LIBSIZE_FULL, normalize = DBA_NORM_LIB, background = FALSE)
+wt_tlr7_ly6cmon_model_norm
+```
+
+Make MA plot of normalized data
+```{r MA plot}
+dba.plotMA(consensus_peaks_wt_tlr7_ly6cmon_counts, bNormalized = TRUE, sub = "Normalized (Default)",
+           contrast = list(TLR7 = consensus_peaks_wt_tlr7_ly6cmon_counts$masks$TLR7,
+                           B6 = consensus_peaks_wt_tlr7_ly6cmon_counts$masks$B6))
+```
+
+Fit model and apply tests for the contrast
+```{r fitting and testing}
+wt_tlr7_ly6cmon_model_norm <- dba.analyze(wt_tlr7_ly6cmon_model_norm)
+dba.show(wt_tlr7_ly6cmon_model_norm, bContrasts = TRUE)
+```
+
+Make volcano plot with differential binding sites
+```{r differential site volcano plot}
+dba.plotVolcano(wt_tlr7_ly6cmon_model_norm)
+```
+
+Make heatmap based on differential binding sites
+```{r differential site heatmap}
+plot(wt_tlr7_ly6cmon_model_norm, contrast = 1)
+```
+
+Get consensus peak set and annotate peaks to promoters and gene bodies
+```{r annotate peaks}
+# Prepare peaks for annotation
+wt_tlr7_ly6cmon_peaklist <- dba.peakset(wt_tlr7_ly6cmon_model_norm, bRetrieve = T, DataType = DBA_DATA_FRAME)
+filterChr <- c("chr1", "chr2", "chr3", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chrX", "chrY")
+wt_tlr7_ly6cmon_peak_bed <- wt_tlr7_ly6cmon_peaklist %>%
+  dplyr::filter(START >= 0, CHR %in% filterChr) %>%
+  dplyr::select(CHR, START, END)
+write.table(wt_tlr7_ly6cmon_peak_bed, file = "differential_peaks/exclude_irf5_tlr7/great_bed_files/TLR7-WT-Ly6CMon_consensus_peaks.bed", quote = FALSE, sep = "\t", row.names = FALSE, col.names = FALSE) # Export consensus peaks BED as background for GREAT
+wt_tlr7_ly6cmon_peaklist$peakID <- 1:nrow(wt_tlr7_ly6cmon_peaklist)
+wt_tlr7_ly6cmon_peaklist.g <- GRanges(seqnames = wt_tlr7_ly6cmon_peaklist$CHR, 
+                                   IRanges(start = wt_tlr7_ly6cmon_peaklist$START, 
+                                           end = wt_tlr7_ly6cmon_peaklist$END), 
+                                   strand = "*", 
+                                   peakID = wt_tlr7_ly6cmon_peaklist$peakID)
+seqlevelsStyle(wt_tlr7_ly6cmon_peaklist.g) <- "UCSC"
+wt_tlr7_ly6cmon_peaklist.g <- wt_tlr7_ly6cmon_peaklist.g[seqnames(wt_tlr7_ly6cmon_peaklist.g) %in% paste0("chr", c(1:23, "X", "Y"))]
+seqlevels(wt_tlr7_ly6cmon_peaklist.g) <- ucsc_levels
+seqlevelsStyle(wt_tlr7_ly6cmon_peaklist.g) <- "NCBI"
+seqlevels(wt_tlr7_ly6cmon_peaklist.g)
+
+# Annotate closest gene bodies
+wt_tlr7_ly6cmon_geneBodies.g <- ChIPpeakAnno::annotatePeakInBatch(wt_tlr7_ly6cmon_peaklist.g,
+                                                               AnnotationData = annoData,
+                                                               output = "nearestLocation",
+                                                               select = "first")
+wt_tlr7_ly6cmon_geneBodies.g <- ChIPpeakAnno::addGeneIDs(wt_tlr7_ly6cmon_geneBodies.g, orgAnn = "org.Mm.eg.db", IDs2Add = c("symbol"))
+wt_tlr7_ly6cmon_nearestGeneBodies <- data.frame(peakID = wt_tlr7_ly6cmon_geneBodies.g$peakID, 
+                                             closestGene = wt_tlr7_ly6cmon_geneBodies.g$symbol, 
+                                             distanceToGene = wt_tlr7_ly6cmon_geneBodies.g$distancetoFeature, 
+                                             closestGeneENS = wt_tlr7_ly6cmon_geneBodies.g$feature)
+
+# Now, all promoters within +/- 10 000 bp (one to many)
+seqlevelsStyle(wt_tlr7_ly6cmon_peaklist.g) <- "UCSC"
+wt_tlr7_ly6cmon_nearPromoters.g <- ChIPpeakAnno::annotatePeakInBatch(wt_tlr7_ly6cmon_peaklist.g, 
+                                                                  AnnotationData = annoData, 
+                                                                  output = "nearestBiDirectionalPromoters",
+                                                                  bindingRegion = c(-10000, 10000),
+                                                                  select = "all")
+wt_tlr7_ly6cmon_nearPromoters.g <- ChIPpeakAnno::addGeneIDs(wt_tlr7_ly6cmon_nearPromoters.g, orgAnn = "org.Mm.eg.db", IDs2Add = c("symbol"))
+wt_tlr7_ly6cmon_nearPromoters <- data.frame(peakID = wt_tlr7_ly6cmon_nearPromoters.g$peakID,
+                                         distanceToPromoter = wt_tlr7_ly6cmon_nearPromoters.g$distanceToSite,
+                                         promoterSymbol = wt_tlr7_ly6cmon_nearPromoters.g$gene_name,
+                                         promoterENS = wt_tlr7_ly6cmon_nearPromoters.g$feature)
+
+# All peaks that weren't annotated, we are now going to find, and then look for the one closest promoter within 100 000 bp (one to one)
+wt_tlr7_ly6cmon_missingPeakIDs <- setdiff(wt_tlr7_ly6cmon_peaklist.g$peakID, wt_tlr7_ly6cmon_nearPromoters.g$peakID)
+wt_tlr7_ly6cmon_missingPeaks.g <- wt_tlr7_ly6cmon_peaklist.g[wt_tlr7_ly6cmon_peaklist.g$peakID %in% wt_tlr7_ly6cmon_missingPeakIDs]
+wt_tlr7_ly6cmon_farPromoters.g <- ChIPpeakAnno::annotatePeakInBatch(wt_tlr7_ly6cmon_missingPeaks.g,
+                                                                 AnnotationData = annoData,
+                                                                 output = "nearestBiDirectionalPromoters", 
+                                                                 bindingRegion = c(-100000, 100000),
+                                                                 select = "all")
+wt_tlr7_ly6cmon_farPromoters <- data.frame(peakID = wt_tlr7_ly6cmon_farPromoters.g$peakID,
+                                        distanceToPromoter = wt_tlr7_ly6cmon_farPromoters.g$distanceToSite,
+                                        promoterSymbol = wt_tlr7_ly6cmon_farPromoters.g$gene_name,
+                                        promoterENS = wt_tlr7_ly6cmon_farPromoters.g$feature)
+wt_tlr7_ly6cmon_promoters <- rbind(wt_tlr7_ly6cmon_nearPromoters, wt_tlr7_ly6cmon_farPromoters)
+wt_tlr7_ly6cmon_promoters <- dplyr::distinct(wt_tlr7_ly6cmon_promoters)
+```
+
+Process contrasts
+```{r process contrasts}
+wt_tlr7_ly6cmon_contrasts <- dba.show(wt_tlr7_ly6cmon_model_norm, bContrast = TRUE)
+wt_tlr7_ly6cmon_contrasts <- dplyr::mutate(wt_tlr7_ly6cmon_contrasts, name = paste0(Group, "_vs_", Group2))
+dge_wt_tlr7_ly6cmon <- c()
+for (iContrast in 1:nrow(wt_tlr7_ly6cmon_contrasts)) {
+  dge_ <- dba.report(wt_tlr7_ly6cmon_model_norm, method = DBA_DESEQ2, contrast = iContrast, th = 1, DataType = DBA_DATA_FRAME)
+  dge_$peakID = as.numeric(rownames(dge_))
+  dge_ <- merge(dge_, wt_tlr7_ly6cmon_nearestGeneBodies, by = "peakID", all.x = TRUE, no.dups = FALSE)
+  dge_ <- left_join(dge_, wt_tlr7_ly6cmon_promoters, by = "peakID", keep = FALSE)
+  dge_$peakPosition <- paste0(dge_$Chr, ":", dge_$Start, "-", dge_$End)
+  dge_ <- dplyr::arrange(dge_, FDR) %>%
+    dplyr::filter(Chr %in% filterChr)
+  dge_wt_tlr7_ly6cmon[[iContrast]] <- dge_
+}
+names(dge_wt_tlr7_ly6cmon) <- wt_tlr7_ly6cmon_contrasts$name
+```
+
+Export differential peaks
+```{r export differential peaks}
+for (contrast in names(dge_wt_tlr7_ly6cmon)) {
+  dge_ <- dge_wt_tlr7_ly6cmon[[contrast]]
+  out <- dge_ %>%
+    dplyr::filter(FDR < 0.05) %>%
+    dplyr::select(peakPosition, Fold, `p-value`, FDR, 
+                  promoterSymbol, promoterENS, distanceToPromoter, 
+                  closestGene, closestGeneENS, distanceToGene) %>%
+    dplyr::rename(logFC = Fold)
+  write.table(out, file = paste0("differential_peaks/exclude_irf5_tlr7/TLR7-WT-Ly6CMon_differential_peaks_annotated.csv"), sep = ",", quote = FALSE, row.names = FALSE)
+  bed <- dge_ %>%
+    dplyr::filter(FDR < 0.05) %>%
+    dplyr::select(Chr, Start, End)
+  bed <- distinct(bed)
+  bed$peakID <- 1:nrow(bed)
+  bed$blank <- "1"
+  bed$strand <- "+"
+  write.table(dplyr::select(bed, peakID, Chr, Start, End, strand), file = "differential_peaks/exclude_irf5_tlr7/TLR7-WT-Ly6CMon_differential_peaks.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  write.table(dplyr::select(bed, Chr, Start, End, strand), file = "differential_peaks/exclude_irf5_tlr7/TLR7-WT-Ly6CMon_differential_peaks_for_liftover.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  # Export minimal BED file of differential peaks for GREAT
+  minimal_bed <- bed %>%
+    dplyr::filter(Start >= 0, Chr %in% filterChr) %>%
+    dplyr::select(Chr, Start, End)
+  write.table(minimal_bed, file = "differential_peaks/exclude_irf5_tlr7/great_bed_files/TLR7-WT-Ly6CMon_differential_peaks.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  # Export BED file for peaks that are significantly more accessible (i.e. upregulated)
+  upregulated_bed <- dge_ %>%
+    dplyr::filter(FDR < 0.05 & Fold > 1) %>%
+    dplyr::select(Chr, Start, End)
+  write.table(upregulated_bed, file = "differential_peaks/exclude_irf5_tlr7/homer_bed_files/TLR7-WT-Ly6CMon_upregulated_peaks.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  # Export BED file for peaks that are significantly less accessible (i.e. downregulated)
+  downregulated_bed <- dge_ %>%
+    dplyr::filter(FDR < 0.05 & Fold < -1) %>%
+    dplyr::select(Chr, Start, End)
+  write.table(downregulated_bed, file = "differential_peaks/exclude_irf5_tlr7/homer_bed_files/TLR7-WT-Ly6CMon_downregulated_peaks.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+}
+```
+
+Count number of reads overlapping differential peaks
+```{r count number of reads per differential peak}
+# Load BED of differential peaks
+wt_tlr7_ly6cmon_diffPeaks <- import("differential_peaks/exclude_irf5_tlr7/great_bed_files/TLR7-WT-Ly6CMon_differential_peaks.bed")
+# Initialize dataframe to store read counts per peak
+wt_tlr7_ly6cmon_peak_names <- paste0(seqnames(wt_tlr7_ly6cmon_diffPeaks), ":", start(wt_tlr7_ly6cmon_diffPeaks), "-", end(wt_tlr7_ly6cmon_diffPeaks))
+wt_tlr7_ly6cmon_peak_readCounts <- data.frame(Peak = wt_tlr7_ly6cmon_peak_names)
+# Count reads overlapping each peak from sample BAM files
+for (i in seq_len(nrow(wt_tlr7_ly6cmon_samples))) {
+  bam_file <- wt_tlr7_ly6cmon_samples$bamReads[i]
+  sample_name <- wt_tlr7_ly6cmon_samples$SampleID[i]
+  gal <- readGAlignments(bam_file)
+  reads_gr <- granges(gal)
+  counts <- countOverlaps(wt_tlr7_ly6cmon_diffPeaks, reads_gr)
+  wt_tlr7_ly6cmon_peak_readCounts[[sample_name]] <- counts
+}
+wt_tlr7_ly6cmon_peak_readCounts$TotalReadsinPeak <- rowSums(wt_tlr7_ly6cmon_peak_readCounts[sapply(wt_tlr7_ly6cmon_peak_readCounts, is.numeric)], na.rm = TRUE)
+#pdf(file = "plots/exclude_irf5_tlr7/TLR7-WT-Ly6CMon_readsPerDAR.pdf", width = 8, height = 6)
+ggplot(wt_tlr7_ly6cmon_peak_readCounts, aes(x = TotalReadsinPeak)) + 
+  geom_histogram(bins = 80, color = "dodgerblue", fill = "white") +
+  scale_x_log10() +
+  labs(title = "TLR7+ vs. WT Ly6CHI monocytes", subtitle = "Reads per differentially-accessible peak", x = "Total Reads in Peak", y = "# of Peaks") +
+  theme_bw()
+#dev.off()
+```
+
+Find top hits
+```{r find top hits}
+wt_tlr7_ly6cmon_top_hits <- dge_wt_tlr7_ly6cmon[[1]] %>%
+  arrange(log10(FDR)) %>%
+  group_by(sign(Fold)) %>%
+  slice_head(n = 15)
+wt_tlr7_ly6cmon_top_hits
+```
+
+Categorize hits and make volcano plot annotated with nearest genes
+```{r nearest gene volcano plot}
+dge_wt_tlr7_ly6cmon_reg <- dge_wt_tlr7_ly6cmon[[1]] %>%
+  mutate(regulation = case_when(
+    Fold > 1 & `FDR`< 0.05 ~ "up",
+    Fold < -1 & `FDR`< 0.05 ~ "down",
+    TRUE ~ "unaffected"
+  ))
+
+#pdf(file = "plots/exclude_irf5_tlr7/TLR7-WT-Ly6CMon_genes_volcano.pdf", width = 10, height = 8)
+ggplot(data = dge_wt_tlr7_ly6cmon_reg, aes(x = Fold, y = -log10(`FDR`), color = regulation)) +
+  geom_vline(xintercept = c(-1, 1), color = "gray", linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), color = "gray", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(data = . %>%
+                    mutate(label = ifelse(peakID %in% wt_tlr7_ly6cmon_top_hits$peakID, closestGene, "")),
+                  aes(label = label), box.padding = 0.75, force = 4, max.overlaps = Inf, show.legend = FALSE) +
+  scale_color_manual(values = c("firebrick1", "#E6E6E6", "dodgerblue1"),
+                     labels = c("Less accessible", "Not significant", "More accessible")) +
+  labs(title = "TLR7+ vs. WT Ly6CHI monocytes", subtitle = "Peaks labeled by nearest gene", color = "", x = expression("log"[2]*"FC"), y = expression("-log"[10]*"FDR")) +
+  theme_classic()
+#dev.off()
+```
+
+Make volcano plot annotated with nearest promoters
+```{r nearest promoter volcano plot}
+#pdf(file = "plots/exclude_irf5_tlr7/TLR7-WT-Ly6CMon_promoters_volcano.pdf", width = 10, height = 8)
+ggplot(data = dge_wt_tlr7_ly6cmon_reg, aes(x = Fold, y = -log10(`FDR`), color = regulation)) +
+  geom_vline(xintercept = c(-1, 1), color = "gray", linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), color = "gray", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(data = . %>%
+                    mutate(label = ifelse(peakID %in% wt_tlr7_ly6cmon_top_hits$peakID, promoterSymbol, "")),
+                  aes(label = label), box.padding = 0.75, force = 8, max.overlaps = Inf, show.legend = FALSE) +
+  scale_color_manual(values = c("firebrick1", "#E6E6E6", "dodgerblue1"),
+                     labels = c("Less accessible", "Not significant", "More accessible")) +
+  labs(title = "TLR7+ vs. WT Ly6CHI monocytes", subtitle = "Peaks labeled by nearest promoter", color = "", x = expression("log"[2]*"FC"), y = expression("-log"[10]*"FDR")) +
+  theme_classic()
+#dev.off()
+```
+
+Make volcano plot annotated without peak annotations
+```{r nearest promoter volcano plot}
+#pdf(file = "plots/exclude_irf5_tlr7/TLR7-WT-Ly6CMon_volcano.pdf", width = 10, height = 8)
+ggplot(data = dge_wt_tlr7_ly6cmon_reg, aes(x = Fold, y = -log10(`FDR`), color = regulation)) +
+  geom_vline(xintercept = c(-1, 1), color = "gray", linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), color = "gray", linetype = "dashed") +
+  geom_point() +
+  scale_color_manual(values = c("firebrick1", "#E6E6E6", "dodgerblue1"),
+                     labels = c("Less accessible", "Not significant", "More accessible")) +
+  labs(title = "TLR7+ vs. WT Ly6CHI monocytes", color = "", x = expression("log"[2]*"FC"), y = expression("-log"[10]*"FDR")) +
+  theme_classic()
+#dev.off()
+```
+
+Determine how many peaks are more, less, or not differentially accessible
+```{r peak counts}
+dge_peaks_only_wt_tlr7_ly6cmon <- dge_wt_tlr7_ly6cmon_reg[, !(names(dge_wt_tlr7_ly6cmon_reg) %in% c("closestGene", "distanceToGene", "closestGeneENS", "distanceToPromoter", "promoterSymbol", "promoterENS"))]
+dge_peaks_only_wt_tlr7_ly6cmon <- unique(dge_peaks_only_wt_tlr7_ly6cmon)
+table(dge_peaks_only_wt_tlr7_ly6cmon$regulation)
+```
+
+## Perform differential binding analysis on TLR7+ iHPCs vs. TLR7+ Ly6CHI monocytes
+
+```{r TLR7+ iHPC Ly6CHI mon consensus peaks}
+# Edit sample sheet to include only TLR7+ iHPCs and Ly6CHI monocytes and remove CD45-1 allele from treatment column
+tlr7_ihpc_ly6cmon_samples <- samples %>%
+  mutate(Treatment = gsub("-CD45-1", "", Treatment)) %>%
+  mutate(Factor = gsub("-CD45-1", "", Factor)) %>%
+  dplyr::filter(Factor == "TLR7_TLR7") %>%
+  dplyr::filter(Tissue == "iHPC" | Tissue == "Ly6CMon")
+tlr7_ihpc_ly6cmon_dba <- dba(sampleSheet=tlr7_ihpc_ly6cmon_samples)
+# Generate consensus peakset
+tlr7_ihpc_ly6cmon_cons_by_cond <- dba.peakset(tlr7_ihpc_ly6cmon_dba, consensus=DBA_CONDITION, minOverlap=2)
+# Retrieve the union of the two condition-level consensuses
+tlr7_ihpc_ly6cmon_consensus_union <- dba.peakset(
+  tlr7_ihpc_ly6cmon_cons_by_cond, bRetrieve=TRUE,
+  peaks=tlr7_ihpc_ly6cmon_cons_by_cond$masks$Consensus,
+  minOverlap=1
+)
+tlr7_ihpc_ly6cmon_consensus_union <- tlr7_ihpc_ly6cmon_consensus_union[width(tlr7_ihpc_ly6cmon_consensus_union) >= 50 & width(tlr7_ihpc_ly6cmon_consensus_union) <= 10000]
+tlr7_ihpc_ly6cmon_dba <- dba.count(tlr7_ihpc_ly6cmon_dba, peaks = tlr7_ihpc_ly6cmon_consensus_union, summits = 250, bUseSummarizeOverlaps=FALSE)
+```
+
+Make MA plot of non-normalized data (using total aligned reads in BAM files)
+```{r MA plot}
+#dba.plotMA(consensus_peaks_tlr7_ihpc_ly6cmon_counts, bNormalized = FALSE, sub = "Non-Normalized",
+#           contrast = list(iHPC = consensus_peaks_tlr7_ihpc_ly6cmon_counts$masks$iHPC,
+#                           Ly6CMon = consensus_peaks_tlr7_ihpc_ly6cmon_counts$masks$Ly6CMon))
+dba.plotMA(tlr7_ihpc_ly6cmon_dba, bNormalized = FALSE, sub = "Non-Normalized",
+           contrast = list(iHPC = tlr7_ihpc_ly6cmon_dba$masks$iHPC,
+                                      Ly6CMon = tlr7_ihpc_ly6cmon_dba$masks$Ly6CMon))
+```
+
+Normalize dataset
+```{r normalize}
+#tlr7_ihpc_ly6cmon_model_norm <- dba.normalize(tlr7_ihpc_ly6cmon_model, method = DBA_EDGER, library = DBA_LIBSIZE_PEAKREADS, normalize = DBA_NORM_TMM, #background = FALSE)
+#tlr7_ihpc_ly6cmon_model_norm
+tlr7_ihpc_ly6cmon_dba <- dba.normalize(tlr7_ihpc_ly6cmon_dba, method = DBA_EDGER, library = DBA_LIBSIZE_PEAKREADS, normalize = DBA_NORM_LIB, background = FALSE)
+tlr7_ihpc_ly6cmon_dba
+```
+
+Make MA plot of normalized data
+```{r MA plot}
+#dba.plotMA(consensus_peaks_tlr7_ihpc_ly6cmon_counts, bNormalized = TRUE, sub = "Normalized (Default)",
+#           contrast = list(iHPC = consensus_peaks_tlr7_ihpc_ly6cmon_counts$masks$iHPC,
+#                           Ly6CMon = consensus_peaks_tlr7_ihpc_ly6cmon_counts$masks$Ly6CMon))
+dba.plotMA(tlr7_ihpc_ly6cmon_dba, bNormalized = TRUE, sub = "Normalized (Default)",
+           contrast = list(iHPC = tlr7_ihpc_ly6cmon_dba$masks$iHPC,
+                           Ly6CMon = tlr7_ihpc_ly6cmon_dba$masks$Ly6CMon))
+```
+
+Establish contrasts to be tested against the model
+```{r establish contrasts}
+#tlr7_ihpc_ly6cmon_model <- dba.contrast(consensus_peaks_tlr7_ihpc_ly6cmon_counts, categories = DBA_TISSUE, block = c(DBA_REPLICATE, DBA_CONDITION), reorderMeta = list(Tissue = "Ly6CMon"))
+#tlr7_ihpc_ly6cmon_model
+tlr7_ihpc_ly6cmon_dba <- dba.contrast(tlr7_ihpc_ly6cmon_dba, categories = DBA_TISSUE, block = c(DBA_REPLICATE), reorderMeta = list(Tissue = "Ly6CMon"))
+tlr7_ihpc_ly6cmon_dba
+```
+
+Fit model and apply tests for the contrast
+```{r fitting and testing}
+#tlr7_ihpc_ly6cmon_model_norm <- dba.analyze(tlr7_ihpc_ly6cmon_model_norm)
+#dba.show(tlr7_ihpc_ly6cmon_model_norm, bContrasts = TRUE)
+tlr7_ihpc_ly6cmon_dba <- dba.analyze(tlr7_ihpc_ly6cmon_dba, method = DBA_EDGER)
+dba.show(tlr7_ihpc_ly6cmon_dba, bContrasts = TRUE)
+```
+
+Make volcano plot with differential binding sites
+```{r differential site volcano plot}
+#dba.plotVolcano(tlr7_ihpc_ly6cmon_model_norm)
+dba.plotVolcano(tlr7_ihpc_ly6cmon_dba, method = DBA_EDGER)
+```
+
+Make heatmap based on differential binding sites
+```{r differential site heatmap}
+#plot(tlr7_ihpc_ly6cmon_model_norm, contrast = 1)
+plot(tlr7_ihpc_ly6cmon_dba, method = DBA_EDGER, contrast = 1)
+```
+
+Get consensus peak set and annotate peaks to promoters and gene bodies
+```{r annotate peaks}
+# Prepare peaks for annotation
+#tlr7_ihpc_ly6cmon_peaklist <- dba.peakset(tlr7_ihpc_ly6cmon_model_norm, bRetrieve = T, DataType = DBA_DATA_FRAME)
+tlr7_ihpc_ly6cmon_peaklist <- dba.peakset(tlr7_ihpc_ly6cmon_dba, bRetrieve = T, DataType = DBA_DATA_FRAME)
+filterChr <- c("chr1", "chr2", "chr3", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chrX", "chrY")
+tlr7_ihpc_ly6cmon_peak_bed <- tlr7_ihpc_ly6cmon_peaklist %>%
+  dplyr::filter(START >= 0, CHR %in% filterChr) %>%
+  dplyr::select(CHR, START, END)
+write.table(tlr7_ihpc_ly6cmon_peak_bed, file = "differential_peaks/exclude_irf5_tlr7/great_bed_files/TLR7-iHPC-Ly6CMon_consensus_peaks.bed", quote = FALSE, sep = "\t", row.names = FALSE, col.names = FALSE) # Export consensus peaks BED as background for GREAT
+tlr7_ihpc_ly6cmon_peaklist$peakID <- 1:nrow(tlr7_ihpc_ly6cmon_peaklist)
+tlr7_ihpc_ly6cmon_peaklist.g <- GRanges(seqnames = tlr7_ihpc_ly6cmon_peaklist$CHR, 
+                           IRanges(start = tlr7_ihpc_ly6cmon_peaklist$START, 
+                                   end = tlr7_ihpc_ly6cmon_peaklist$END), 
+                           strand = "*", 
+                           peakID = tlr7_ihpc_ly6cmon_peaklist$peakID)
+seqlevelsStyle(tlr7_ihpc_ly6cmon_peaklist.g) <- "UCSC"
+tlr7_ihpc_ly6cmon_peaklist.g <- tlr7_ihpc_ly6cmon_peaklist.g[seqnames(tlr7_ihpc_ly6cmon_peaklist.g) %in% paste0("chr", c(1:23, "X", "Y"))]
+seqlevels(tlr7_ihpc_ly6cmon_peaklist.g) <- ucsc_levels
+seqlevelsStyle(tlr7_ihpc_ly6cmon_peaklist.g) <- "NCBI"
+seqlevels(tlr7_ihpc_ly6cmon_peaklist.g)
+
+# Annotate closest gene bodies
+tlr7_ihpc_ly6cmon_geneBodies.g <- ChIPpeakAnno::annotatePeakInBatch(tlr7_ihpc_ly6cmon_peaklist.g,
+                                                               AnnotationData = annoData,
+                                                               output = "nearestLocation",
+                                                               select = "first")
+tlr7_ihpc_ly6cmon_geneBodies.g <- ChIPpeakAnno::addGeneIDs(tlr7_ihpc_ly6cmon_geneBodies.g, orgAnn = "org.Mm.eg.db", IDs2Add = c("symbol"))
+tlr7_ihpc_ly6cmon_nearestGeneBodies <- data.frame(peakID = tlr7_ihpc_ly6cmon_geneBodies.g$peakID, 
+                                             closestGene = tlr7_ihpc_ly6cmon_geneBodies.g$symbol, 
+                                             distanceToGene = tlr7_ihpc_ly6cmon_geneBodies.g$distancetoFeature, 
+                                             closestGeneENS = tlr7_ihpc_ly6cmon_geneBodies.g$feature)
+
+# Now, all promoters within +/- 10 000 bp (one to many)
+seqlevelsStyle(tlr7_ihpc_ly6cmon_peaklist.g) <- "UCSC"
+tlr7_ihpc_ly6cmon_nearPromoters.g <- ChIPpeakAnno::annotatePeakInBatch(tlr7_ihpc_ly6cmon_peaklist.g, 
+                                                                 AnnotationData = annoData, 
+                                                                 output = "nearestBiDirectionalPromoters",
+                                                                 bindingRegion = c(-10000, 10000),
+                                                                 select = "all")
+tlr7_ihpc_ly6cmon_nearPromoters.g <- ChIPpeakAnno::addGeneIDs(tlr7_ihpc_ly6cmon_nearPromoters.g, orgAnn = "org.Mm.eg.db", IDs2Add = c("symbol"))
+tlr7_ihpc_ly6cmon_nearPromoters <- data.frame(peakID = tlr7_ihpc_ly6cmon_nearPromoters.g$peakID,
+                                         distanceToPromoter = tlr7_ihpc_ly6cmon_nearPromoters.g$distanceToSite,
+                                         promoterSymbol = tlr7_ihpc_ly6cmon_nearPromoters.g$gene_name,
+                                         promoterENS = tlr7_ihpc_ly6cmon_nearPromoters.g$feature)
+
+# All peaks that weren't annotated, we are now going to find, and then look for the one closest promoter within 100 000 bp (one to one)
+tlr7_ihpc_ly6cmon_missingPeakIDs <- setdiff(tlr7_ihpc_ly6cmon_peaklist.g$peakID, tlr7_ihpc_ly6cmon_nearPromoters.g$peakID)
+tlr7_ihpc_ly6cmon_missingPeaks.g <- tlr7_ihpc_ly6cmon_peaklist.g[tlr7_ihpc_ly6cmon_peaklist.g$peakID %in% tlr7_ihpc_ly6cmon_missingPeakIDs]
+tlr7_ihpc_ly6cmon_farPromoters.g <- ChIPpeakAnno::annotatePeakInBatch(tlr7_ihpc_ly6cmon_missingPeaks.g,
+                                                                 AnnotationData = annoData,
+                                                                 output = "nearestBiDirectionalPromoters", 
+                                                                 bindingRegion = c(-100000, 100000),
+                                                                 select = "all")
+tlr7_ihpc_ly6cmon_farPromoters <- data.frame(peakID = tlr7_ihpc_ly6cmon_farPromoters.g$peakID,
+                                        distanceToPromoter = tlr7_ihpc_ly6cmon_farPromoters.g$distanceToSite,
+                                        promoterSymbol = tlr7_ihpc_ly6cmon_farPromoters.g$gene_name,
+                                        promoterENS = tlr7_ihpc_ly6cmon_farPromoters.g$feature)
+tlr7_ihpc_ly6cmon_promoters <- rbind(tlr7_ihpc_ly6cmon_nearPromoters, tlr7_ihpc_ly6cmon_farPromoters)
+tlr7_ihpc_ly6cmon_promoters <- dplyr::distinct(tlr7_ihpc_ly6cmon_promoters)
+```
+
+Process contrasts
+```{r process contrasts}
+#tlr7_ihpc_ly6cmon_contrasts <- dba.show(tlr7_ihpc_ly6cmon_model_norm, bContrast = TRUE)
+tlr7_ihpc_ly6cmon_contrasts <- dba.show(tlr7_ihpc_ly6cmon_dba, bContrast = TRUE)
+tlr7_ihpc_ly6cmon_contrasts <- dplyr::mutate(tlr7_ihpc_ly6cmon_contrasts, name = paste0(Group, "_vs_", Group2))
+dge_tlr7_ihpc_ly6cmon <- c()
+for (iContrast in 1:nrow(tlr7_ihpc_ly6cmon_contrasts)) {
+#  dge_ <- dba.report(tlr7_ihpc_ly6cmon_model_norm, method = DBA_DESEQ2, contrast = iContrast, th = 1, DataType = DBA_DATA_FRAME)
+  dge_ <- dba.report(tlr7_ihpc_ly6cmon_dba, method = DBA_EDGER, contrast = iContrast, th = 1, DataType = DBA_DATA_FRAME)
+  dge_$peakID = as.numeric(rownames(dge_))
+  dge_ <- merge(dge_, tlr7_ihpc_ly6cmon_nearestGeneBodies, by = "peakID", all.x = TRUE, no.dups = FALSE)
+  dge_ <- left_join(dge_, tlr7_ihpc_ly6cmon_promoters, by = "peakID", keep = FALSE)
+  dge_$peakPosition <- paste0(dge_$Chr, ":", dge_$Start, "-", dge_$End)
+  dge_ <- dplyr::arrange(dge_, FDR) %>%
+    dplyr::filter(Chr %in% filterChr)
+  dge_tlr7_ihpc_ly6cmon[[iContrast]] <- dge_
+}
+names(dge_tlr7_ihpc_ly6cmon) <- tlr7_ihpc_ly6cmon_contrasts$name
+```
+
+Export differential peaks
+```{r export differential peaks}
+options(scipen = 999) # Turn off scientific notation
+for (contrast in names(dge_tlr7_ihpc_ly6cmon)) {
+  dge_ <- dge_tlr7_ihpc_ly6cmon[[contrast]]
+  out <- dge_ %>%
+    dplyr::filter(FDR < 0.05) %>%
+    dplyr::select(peakPosition, Fold, `p-value`, FDR, 
+                  promoterSymbol, promoterENS, distanceToPromoter, 
+                  closestGene, closestGeneENS, distanceToGene) %>%
+    dplyr::rename(logFC = Fold)
+  write.table(out, file = paste0("differential_peaks/exclude_irf5_tlr7/TLR7-iHPC-Ly6CMon_differential_peaks_annotated.csv"), sep = ",", quote = FALSE, row.names = FALSE)
+  bed <- dge_ %>%
+    dplyr::filter(FDR < 0.05) %>%
+    dplyr::select(Chr, Start, End)
+  bed <- distinct(bed)
+  bed$peakID <- 1:nrow(bed)
+  bed$blank <- "1"
+  bed$strand <- "+"
+  bed$Start <- as.numeric(bed$Start)
+  bed$End <- as.numeric(bed$End)
+  write.table(dplyr::select(bed, peakID, Chr, Start, End, strand), file = "differential_peaks/exclude_irf5_tlr7/TLR7-iHPC-Ly6CMon_differential_peaks.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  write.table(dplyr::select(bed, Chr, Start, End, strand), file = "differential_peaks/exclude_irf5_tlr7/TLR7-iHPC-Ly6CMon_differential_peaks_for_liftover.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  # Export minimal BED file of differential peaks for GREAT
+  minimal_bed <- bed %>%
+    dplyr::filter(Start >= 0, Chr %in% filterChr) %>%
+    dplyr::select(Chr, Start, End)
+  write.table(minimal_bed, file = "differential_peaks/exclude_irf5_tlr7/great_bed_files/TLR7-iHPC-Ly6CMon_differential_peaks.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  # Export BED file for peaks that are significantly more accessible (i.e. upregulated)
+  upregulated_bed <- dge_ %>%
+    dplyr::filter(FDR < 0.05 & Fold > 1) %>%
+    dplyr::select(Chr, Start, End)
+  write.table(upregulated_bed, file = "differential_peaks/exclude_irf5_tlr7/homer_bed_files/TLR7-iHPC-Ly6CMon_upregulated_peaks.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  # Export BED file for peaks that are significantly less accessible (i.e. downregulated)
+  downregulated_bed <- dge_ %>%
+    dplyr::filter(FDR < 0.05 & Fold < -1) %>%
+    dplyr::select(Chr, Start, End)
+  write.table(downregulated_bed, file = "differential_peaks/exclude_irf5_tlr7/homer_bed_files/TLR7-iHPC-Ly6CMon_downregulated_peaks.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+}
+```
+
+Find top hits
+```{r find top hits}
+tlr7_ihpc_ly6cmon_top_hits <- dge_tlr7_ihpc_ly6cmon[[1]] %>%
+  arrange(log10(FDR)) %>%
+  group_by(sign(Fold)) %>%
+  slice_head(n = 15)
+tlr7_ihpc_ly6cmon_top_hits
+```
+
+Categorize hits and make volcano plot annotated with nearest genes
+```{r nearest gene volcano plot}
+dge_tlr7_ihpc_ly6cmon_reg <- dge_tlr7_ihpc_ly6cmon[[1]] %>%
+  mutate(regulation = case_when(
+    Fold > 1 & `FDR`< 0.05 ~ "up",
+    Fold < -1 & `FDR`< 0.05 ~ "down",
+    TRUE ~ "unaffected"
+  ))
+
+#pdf(file = "plots/exclude_irf5_tlr7/TLR7-iHPC-Ly6CMon_genes_volcano.pdf", width = 8, height = 8)
+ggplot(data = dge_tlr7_ihpc_ly6cmon_reg, aes(x = Fold, y = -log10(`FDR`), color = regulation)) +
+  geom_point(alpha=0.7, size=2.5, shape = 19) +
+  geom_text_repel(data = . %>%
+    mutate(label = ifelse(peakID %in% tlr7_ihpc_ly6cmon_top_hits$peakID, closestGene, "")),
+    aes(label = label), color = "black", size = 3.5, segment.color = "black", segment.size = 0.4, box.padding = 0.75, force = 8, max.overlaps = Inf, show.legend = FALSE) +
+  scale_color_manual(values = c("#2166AC", "#E6E6E6", "#B2182B"),
+                     labels = c("More accessible in TLR7.1 monocytes", "Not significant", "More accessible in TLR7.1 iHPCs")) +
+#  ylim(0, 40) +
+  geom_vline(xintercept = c(-1, 1), color = "black", linetype = "dotted", linewidth = 0.3) +
+  geom_hline(yintercept = -log10(0.05), color = "black", linetype = "dotted", linewidth = 0.3) +
+  labs(title = "TLR7.1 iHPCs vs. TLR7.1 monocytes", subtitle = "Peaks labeled by nearest gene", color = "", x = expression("log"[2]*"FC"), y = expression("-log"[10]*"FDR")) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+#dev.off()
+```
+
+Make volcano plot annotated with nearest promoters
+```{r nearest promoter volcano plot}
+#pdf(file = "plots/exclude_irf5_tlr7/TLR7-iHPC-Ly6CMon_promoters_volcano.pdf", width = 8, height = 8)
+ggplot(data = dge_tlr7_ihpc_ly6cmon_reg, aes(x = Fold, y = -log10(`FDR`), color = regulation)) +
+  geom_point(alpha=0.7, size=2.5, shape = 19) +
+  geom_text_repel(data = . %>%
+    mutate(label = ifelse(peakID %in% tlr7_ihpc_ly6cmon_top_hits$peakID, promoterSymbol, "")),
+    aes(label = label), color = "black", size = 3.5, segment.color = "black", segment.size = 0.4, box.padding = 0.75, force = 8, max.overlaps = Inf, show.legend = FALSE) +
+  scale_color_manual(values = c("#2166AC", "#E6E6E6", "#B2182B"),
+                     labels = c("More accessible in TLR7.1 monocytes", "Not significant", "More accessible in TLR7.1 iHPCs")) +
+#  ylim(0, 40) +
+  geom_vline(xintercept = c(-1, 1), color = "black", linetype = "dotted", linewidth = 0.3) +
+  geom_hline(yintercept = -log10(0.05), color = "black", linetype = "dotted", linewidth = 0.3) +
+  labs(title = "TLR7.1 iHPCs vs. TLR7.1 monocytes", subtitle = "Peaks labeled by nearest promoter", color = "", x = expression("log"[2]*"FC"), y = expression("-log"[10]*"FDR")) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+#dev.off()
+```
+
+Make volcano plot annotated without peak annotations
+```{r no annotations volcano plot}
+pdf(file = "plots/exclude_irf5_tlr7/TLR7-iHPC-Ly6CMon_volcano.pdf", width = 8, height = 8)
+ggplot(data = dge_tlr7_ihpc_ly6cmon_reg, aes(x = Fold, y = -log10(`FDR`), color = regulation)) +
+  geom_point(alpha=0.7, size=2.5, shape = 19) +
+  scale_color_manual(values = c("#2166AC", "#E6E6E6", "#B2182B"),
+                     labels = c("More accessible in TLR7.1 monocytes", "Not significant", "More accessible in TLR7.1 iHPCs")) +
+#  ylim(0, 40) +
+  geom_vline(xintercept = c(-1, 1), color = "black", linetype = "dotted", linewidth = 0.3) +
+  geom_hline(yintercept = -log10(0.05), color = "black", linetype = "dotted", linewidth = 0.3) +
+  labs(title = "TLR7.1 iHPCs vs. TLR7.1 monocytes", color = "", x = expression("log"[2]*"FC"), y = expression("-log"[10]*"FDR")) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+dev.off()
+```
+
+Determine how many peaks are more, less, or not differentially accessible
+```{r peak counts}
+dge_peaks_only_tlr7_ihpc_ly6cmon <- dge_tlr7_ihpc_ly6cmon_reg[, !(names(dge_tlr7_ihpc_ly6cmon_reg) %in% c("closestGene", "distanceToGene", "closestGeneENS", "distanceToPromoter", "promoterSymbol", "promoterENS"))]
+dge_peaks_only_tlr7_ihpc_ly6cmon <- unique(dge_peaks_only_tlr7_ihpc_ly6cmon)
+table(dge_peaks_only_tlr7_ihpc_ly6cmon$regulation)
+```
+
+Test code for PCA plot formatting to send to Susana
+```{r}
+df <- data.frame(
+  PC1 = runif(10),
+  PC2 = runif(10)
+)
+df$Group <- c(1, 2, 3, 4, 3, 4, 2, 1, 1, 3)
+
+blue = rgb(45, 173, 216, maxColorValue=255)
+magenta = rgb(216, 23, 126, maxColorValue=255)
+purple = rgb(47, 41, 106, maxColorValue=255)
+green = rgb(0, 153, 73, maxColorValue=255)
+
+group_colors <-c(blue, magenta, purple, green)
+
+library(lattice)
+
+
+xyplot(
+  PC2 ~ PC1,
+  data = df,
+  groups = Group,
+
+  auto.key = list(
+    space = "right",
+    points = TRUE,
+    lines = FALSE,
+    cex = 1
+  ),
+
+  pch = 16,
+  cex = 1.2,
+  col = group_colors,
+
+  par.settings = list(
+    superpose.symbol = list(
+      pch = 16,
+      col = group_colors,
+      cex = 1.2
+    )
+  ),
+
+  xlab = "Principal Component #1 [63%]",
+  ylab = "Principal Component #2 [15%]",
+  main = "PCA: Treatment",
+
+  aspect = 1
+)
+```
+
+Correlate DARs with DEG data from RNAseq
+```{r correlate DAR DEG data}
+# Import RNAseq DEG data and filter to only significant DEGs (FDR/adjp < 0.05 and 2-fold change)
+rnaseq_tlr7_ihpc_ly6cmon <- read.csv("rnaseq_degs/spleen_DEgenes_iHPC_TLR7.1 - Ly6ChiMono_TLR7.1_TTchimeras_changedCategNames (1).csv")
+rnaseq_tlr7_ihpc_ly6cmon_significant <- rnaseq_tlr7_ihpc_ly6cmon %>%
+  dplyr::filter(adj.P.Val <= 0.05) #%>%
+#  dplyr::filter(abs(log2FC) >= 1)
+colnames(rnaseq_tlr7_ihpc_ly6cmon_significant)[colnames(rnaseq_tlr7_ihpc_ly6cmon_significant) == "log2FC"] <- "rnaseq_log2FC"
+# Determine DEGs that have multiple log2FC
+rnaseq_tlr7_ihpc_ly6cmon_significant$gene[duplicated(rnaseq_tlr7_ihpc_ly6cmon_significant$gene)] # None
+# Calculate maximum log2FC for DEGs with multiple log2FC (not needed based on checking duplicates)
+#rnaseq_tlr7_ihpc_ly6cmon_maxlog2FC <- rnaseq_tlr7_ihpc_ly6cmon_significant %>%
+#  group_by(gene) %>%
+#  summarize(max_rnaseq_log2FC = max(log2FC, na.rm = TRUE))
+# Retain only significant DARs in DAR dataframe (FDR/adjp < 0.05)
+atac_tlr7_ihpc_ly6cmon_significant <- dge_tlr7_ihpc_ly6cmon_reg %>%
+  dplyr::filter(FDR <= 0.05) %>%
+  dplyr::filter(!is.na(closestGene)) %>%
+  dplyr::mutate(Start = as.integer(Start)) %>%
+  dplyr::mutate(End = as.integer(End)) %>%
+  dplyr::rename(gene = closestGene) %>%
+  dplyr::rename(atac_log2FC = Fold)
+# Calculate average log2FC for genes near multiple DARs and set FC cutoff to 2
+#atac_tlr7_ihpc_ly6cmon_meanlog2FC <- atac_tlr7_ihpc_ly6cmon_significant %>%
+#  group_by(closestGene) %>%
+#  summarize(mean_atac_log2FC = mean(Fold, na.rm = TRUE)) %>%
+#  dplyr::filter(!is.na(closestGene)) %>%
+#  dplyr::rename(gene = closestGene) %>%
+#  dplyr::filter(abs(mean_atac_log2FC) >= 1)
+# Merge DEG and DAR log2FC dataframes and categorize based on quadrant
+#merged_rnaseq_atac_tlr7_ihpc_ly6cmon <- left_join(rnaseq_tlr7_ihpc_ly6cmon_maxlog2FC, #atac_tlr7_ihpc_ly6cmon_meanlog2FC, by = "gene")
+# Merge DEG and DAR dataframes without log2FC filters and categorize based on quadrant
+merged_rnaseq_atac_tlr7_ihpc_ly6cmon <- left_join(rnaseq_tlr7_ihpc_ly6cmon_significant, atac_tlr7_ihpc_ly6cmon_significant, by = "gene")
+merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters <- merged_rnaseq_atac_tlr7_ihpc_ly6cmon %>%
+  dplyr::select(-distanceToPromoter, -promoterSymbol, -promoterENS) %>%
+  distinct()
+merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters$quadrant <- ifelse(merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters$atac_log2FC >= 1 & merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters$rnaseq_log2FC >= 1, "I", 
+  ifelse(merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters$atac_log2FC <= -1 & merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters$rnaseq_log2FC >= 1, "II", 
+    ifelse(merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters$atac_log2FC <= -1 & merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters$rnaseq_log2FC <= -1, "III",
+      ifelse(merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters$atac_log2FC >= 1 & merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters$rnaseq_log2FC <= -1,"IV", "non-significant"))))
+merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters$quadrant <- factor(merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters$quadrant, levels = c("I", "II", "III", "IV", "non-significant"))
+# Plot DEG vs. DAR log2FC
+pdf(file = "plots/exclude_irf5_tlr7/TLR7-iHPC-Ly6CMon_RNAseq_ATAC_correlation.pdf", width = 8, height = 8)
+ggplot(data = merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters, aes(x = atac_log2FC, y = rnaseq_log2FC, color = quadrant)) +
+  geom_point(show.legend = FALSE) +
+  scale_color_manual(values = c("#7CAE00", "#F8766D", "#00BFC4", "#C77CFF", "#E6E6E6")) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", color = "black", size = 0.5, se = FALSE, show.legend = FALSE) +
+  stat_cor(aes(group = 1, label = paste(after_stat(rr.label), after_stat(p.label), sep = "~`,`~")), show.legend = FALSE) +
+  geom_vline(xintercept = 0, color = "gray", linetype = "dotted") +
+  geom_hline(yintercept = 0, color = "gray", linetype = "dotted") +
+  labs(title = "TLR7+ iHPCs vs. Ly6CHI monocytes", color = "", x = expression("ATAC-seq log"[2]*"FC"), y = expression("RNAseq log"[2]*"FC")) +
+  theme_bw()
+dev.off()
+# Export data for DEG vs. DAR plot
+write.csv(merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters, "differential_peaks/exclude_irf5_tlr7/TLR7-iHPC-Ly6CMon_DEG_DAR_correlation.csv", row.names = FALSE)
+# Export peak data for quadrants I (up in both RNAseq/ATAC) and III (down in both RNAseq/ATAC) for HOMER
+merged_rnaseq_atac_tlr7_ihpc_ly6cmon_upPeaks <- merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters %>%
+  dplyr::filter(quadrant == "I") %>%
+  dplyr::select(Chr, Start, End)
+write.table(merged_rnaseq_atac_tlr7_ihpc_ly6cmon_upPeaks, file = "differential_peaks/exclude_irf5_tlr7/homer_bed_files/TLR7-iHPC_rnaAtacUpregulatedPeaks.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+merged_rnaseq_atac_tlr7_ihpc_ly6cmon_downPeaks <- merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters %>%
+  dplyr::filter(quadrant == "III") %>%
+  dplyr::select(Chr, Start, End)
+write.table(merged_rnaseq_atac_tlr7_ihpc_ly6cmon_downPeaks, file = "differential_peaks/exclude_irf5_tlr7/homer_bed_files/TLR7-Ly6CMon_rnaAtacUpregulatedPeaks.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+```
+
+Calculate R2 values with and without non-significant DEGs/DARs
+```{r}
+# With non-significant DEGs/DARs
+rnaseq_atac_tlr7_ihpc_ly6cmon_NAFiltered <- subset(merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters, !is.na(rnaseq_log2FC) & !is.na(atac_log2FC))
+withNonSig_model <- lm(rnaseq_log2FC ~ atac_log2FC, data = rnaseq_atac_tlr7_ihpc_ly6cmon_NAFiltered)
+withNonSig_r2 <- summary(withNonSig_model)$r.squared #R2 = 0.339
+withNonSig_pvalue <- summary(withNonSig_model)$coefficients[2, 4] #p < 2e-16
+summary(withNonSig_model)
+# Without non-significant DEGs/DARs
+rnaseq_atac_tlr7_ihpc_ly6cmon_nonSigFiltered <- subset(merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters, !is.na(rnaseq_log2FC) & !is.na(atac_log2FC) & quadrant != "non-significant")
+withoutNonSig_model <- lm(rnaseq_log2FC ~ atac_log2FC, data = rnaseq_atac_tlr7_ihpc_ly6cmon_nonSigFiltered)
+withoutNonSig_r2 <- summary(withoutNonSig_model)$r.squared #R2 = 0.435
+withoutNonSig_pvalue <- summary(withoutNonSig_model)$coefficients[2, 4] #p < 2e-16
+summary(withoutNonSig_model)
+```
+
+Correlate DARs with DEG data from RNAseq only for peaks that have an IRF5 binding site
+```{r}
+# Export all merged RNAseq/ATAC merged peak data to overlap with IRF5 binding sites
+merged_rnaseq_atac_tlr7_ihpc_ly6cmon_forBedFile <- merged_rnaseq_atac_tlr7_ihpc_ly6cmon_noPromoters %>%
+  dplyr::select(Chr, Start, End, gene, rnaseq_log2FC, atac_log2FC, peakPosition, quadrant) %>%
+  dplyr::filter(!is.na(Chr))
+write.table(merged_rnaseq_atac_tlr7_ihpc_ly6cmon_forBedFile, file = "differential_peaks/exclude_irf5_tlr7/homer_bed_files/TLR7-iHPC-Ly6CMon_rnaAtacAllPeaks.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+# Import BED file post IRF5 overlap
+merged_rnaseq_atac_tlr7_ihpc_ly6cmon_IRF5overlap <- read.table("differential_peaks/exclude_irf5_tlr7/homer_bed_files/TLR7-iHPC-Ly6CMon_rnaAtacAllPeaks_IRF5overlap.bed", sep = "\t", header = FALSE, col.names = c("Chr", "Start", "End", "gene", "rnaseq_log2FC", "atac_log2FC", "peakPosition", "quadrant")) %>%
+  distinct()
+# Plot DEG vs. DAR log2FC
+pdf(file = "plots/exclude_irf5_tlr7/TLR7-iHPC-Ly6CMon_IRF5bound_RNAseq_ATAC_correlation.pdf", width = 8, height = 8)
+ggplot(data = merged_rnaseq_atac_tlr7_ihpc_ly6cmon_IRF5overlap, aes(x = atac_log2FC, y = rnaseq_log2FC, color = quadrant)) +
+  geom_point(show.legend = FALSE) +
+  scale_color_manual(values = c("#7CAE00", "#F8766D", "#00BFC4", "#C77CFF", "#E6E6E6")) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", color = "black", size = 0.5, se = FALSE, show.legend = FALSE) +
+  stat_cor(aes(group = 1, label = paste(after_stat(rr.label), after_stat(p.label), sep = "~`,`~")), show.legend = FALSE) +
+  geom_vline(xintercept = 0, color = "gray", linetype = "dotted") +
+  geom_hline(yintercept = 0, color = "gray", linetype = "dotted") +
+  labs(title = "TLR7+ iHPCs vs. Ly6CHI monocytes, IRF5-bound sites", color = "", x = expression("ATAC-seq log"[2]*"FC"), y = expression("RNAseq log"[2]*"FC")) +
+  theme_bw()
+dev.off()
+```
+
+Calculate R2 values with and without non-significant DEGs/DARs
+```{r}
+# With non-significant DEGs/DARs
+rnaseq_atac_tlr7_ihpc_ly6cmon_irf5_NAFiltered <- subset(merged_rnaseq_atac_tlr7_ihpc_ly6cmon_IRF5overlap, !is.na(rnaseq_log2FC) & !is.na(atac_log2FC))
+irf5_withNonSig_model <- lm(rnaseq_log2FC ~ atac_log2FC, data = rnaseq_atac_tlr7_ihpc_ly6cmon_irf5_NAFiltered)
+irf5_withNonSig_r2 <- summary(irf5_withNonSig_model)$r.squared #R2 = 0.314
+irf5_withNonSig_pvalue <- summary(irf5_withNonSig_model)$coefficients[2, 4] #p < 2e-16
+summary(irf5_withNonSig_model)
+# Without non-significant DEGs/DARs
+rnaseq_atac_tlr7_ihpc_ly6cmon_irf5_nonSigFiltered <- subset(merged_rnaseq_atac_tlr7_ihpc_ly6cmon_IRF5overlap, !is.na(rnaseq_log2FC) & !is.na(atac_log2FC) & quadrant != "non-significant")
+irf5_withoutNonSig_model <- lm(rnaseq_log2FC ~ atac_log2FC, data = rnaseq_atac_tlr7_ihpc_ly6cmon_irf5_nonSigFiltered)
+irf5_withoutNonSig_r2 <- summary(irf5_withoutNonSig_model)$r.squared #R2 = 0.440
+irf5_withoutNonSig_pvalue <- summary(irf5_withoutNonSig_model)$coefficients[2, 4] #p < 2e-16
+summary(irf5_withoutNonSig_model)
+```
+
+## pMon
+
+#### TLR7+ vs. TLR7+IRF5ko patrolling monocytes
+
+```{r patrolling mon consensus peaks}
+# Edit sample sheet to include only pMons and remove CD45-1 allele from treatment column, generate DBA object
+pmon_samples <- samples %>%
+  mutate(Treatment = gsub("-CD45-1", "", Treatment)) %>%
+  dplyr::filter(Tissue == "pMon")
+pmon_dba <- dba(sampleSheet=pmon_samples)
+# Generate consensus peakset
+pmon_consensus_peakset <- dba.peakset(pmon_dba, consensus = TRUE, minOverlap = 2)
+# Filter consensus peakset to exclude peaks <50bp or >10000bp
+pmon_filtered_consensus_peakset <- dba.peakset(pmon_consensus_peakset, bRetrieve = TRUE) #Number of peaks before filtering: 39464
+pmon_filtered_consensus_peakset <- pmon_filtered_consensus_peakset[width(pmon_filtered_consensus_peakset) >= 50 & width(pmon_filtered_consensus_peakset) <= 10000] #Number of peaks after filtering: 39434
+# Make count matrix using filtered peaks
+consensus_peaks_pmon_counts <- dba.count(pmon_dba, peaks = pmon_filtered_consensus_peakset, summits = TRUE)
+dba.plotPCA(consensus_peaks_pmon_counts, DBA_TREATMENT)
+```
+
+Make MA plot of non-normalized data (using total aligned reads in BAM files)
+```{r MA plot}
+dba.plotMA(consensus_peaks_pmon_counts, bNormalized = FALSE, sub = "Non-Normalized",
+           contrast = list(`TLR7-IRF5ko` = consensus_peaks_pmon_counts$masks$`TLR7-IRF5ko`,
+                           TLR7 = consensus_peaks_pmon_counts$masks$TLR7))
+```
+
+Establish contrasts to be tested against the model
+```{r establish contrasts}
+pmon_model <- dba.contrast(consensus_peaks_pmon_counts, categories = DBA_TREATMENT, block = c(DBA_REPLICATE, DBA_CONDITION), reorderMeta = list(Treatment = "TLR7"))
+pmon_model
+```
+
+Normalize dataset
+```{r normalize}
+pmon_model_norm <- dba.normalize(pmon_model, method = DBA_DESEQ2, library = DBA_LIBSIZE_FULL, normalize = DBA_NORM_LIB, background = FALSE)
+pmon_model_norm
+```
+
+Make MA plot of normalized data
+```{r MA plot}
+dba.plotMA(consensus_peaks_pmon_counts, bNormalized = TRUE, sub = "Normalized (Default)",
+           contrast = list(`TLR7-IRF5ko` = consensus_peaks_pmon_counts$masks$`TLR7-IRF5ko`,
+                           TLR7 = consensus_peaks_pmon_counts$masks$TLR7))
+```
+
+Fit model and apply tests for the contrast
+```{r fitting and testing}
+pmon_model_norm <- dba.analyze(pmon_model_norm)
+dba.show(pmon_model_norm, bContrasts = TRUE)
+```
+
+Make volcano plot with differential binding sites
+```{r differential site volcano plot}
+dba.plotVolcano(pmon_model_norm)
+```
+
+Make heatmap based on differential binding sites
+```{r differential site heatmap}
+plot(pmon_model_norm, contrast = 1)
+```
+
+Get consensus peak set and annotate peaks to promoters and gene bodies
+```{r annotate peaks}
+# Prepare peaks for annotation
+pmon_peaklist <- dba.peakset(pmon_model_norm, bRetrieve = T, DataType = DBA_DATA_FRAME)
+filterChr <- c("chr1", "chr2", "chr3", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chrX", "chrY")
+pmon_peak_bed <- pmon_peaklist %>%
+  dplyr::filter(START >= 0, CHR %in% filterChr) %>%
+  dplyr::select(CHR, START, END)
+write.table(pmon_peak_bed, file = "differential_peaks/exclude_irf5_tlr7/great_bed_files/TLR7IRF5ko-TLR7-pMon_consensus_peaks.bed", quote = FALSE, sep = "\t", row.names = FALSE, col.names = FALSE) # Export consensus peaks BED as background for GREAT
+pmon_peaklist$peakID <- 1:nrow(pmon_peaklist)
+pmon_peaklist.g <- GRanges(seqnames = pmon_peaklist$CHR, 
+                                   IRanges(start = pmon_peaklist$START, 
+                                           end = pmon_peaklist$END), 
+                                   strand = "*", 
+                                   peakID = pmon_peaklist$peakID)
+seqlevelsStyle(pmon_peaklist.g) <- "UCSC"
+pmon_peaklist.g <- pmon_peaklist.g[seqnames(pmon_peaklist.g) %in% paste0("chr", c(1:23, "X", "Y"))]
+seqlevels(pmon_peaklist.g) <- ucsc_levels
+seqlevelsStyle(pmon_peaklist.g) <- "NCBI"
+seqlevels(pmon_peaklist.g)
+
+# Annotate closest gene bodies
+pmon_geneBodies.g <- ChIPpeakAnno::annotatePeakInBatch(pmon_peaklist.g,
+                                                               AnnotationData = annoData,
+                                                               output = "nearestLocation",
+                                                               select = "first")
+pmon_geneBodies.g <- ChIPpeakAnno::addGeneIDs(pmon_geneBodies.g, orgAnn = "org.Mm.eg.db", IDs2Add = c("symbol"))
+pmon_nearestGeneBodies <- data.frame(peakID = pmon_geneBodies.g$peakID, 
+                                             closestGene = pmon_geneBodies.g$symbol, 
+                                             distanceToGene = pmon_geneBodies.g$distancetoFeature, 
+                                             closestGeneENS = pmon_geneBodies.g$feature)
+
+# Now, all promoters within +/- 10 000 bp (one to many)
+seqlevelsStyle(pmon_peaklist.g) <- "UCSC"
+pmon_nearPromoters.g <- ChIPpeakAnno::annotatePeakInBatch(pmon_peaklist.g, 
+                                                                  AnnotationData = annoData, 
+                                                                  output = "nearestBiDirectionalPromoters",
+                                                                  bindingRegion = c(-10000, 10000),
+                                                                  select = "all")
+pmon_nearPromoters.g <- ChIPpeakAnno::addGeneIDs(pmon_nearPromoters.g, orgAnn = "org.Mm.eg.db", IDs2Add = c("symbol"))
+pmon_nearPromoters <- data.frame(peakID = pmon_nearPromoters.g$peakID,
+                                         distanceToPromoter = pmon_nearPromoters.g$distanceToSite,
+                                         promoterSymbol = pmon_nearPromoters.g$gene_name,
+                                         promoterENS = pmon_nearPromoters.g$feature)
+
+# All peaks that weren't annotated, we are now going to find, and then look for the one closest promoter within 100 000 bp (one to one)
+pmon_missingPeakIDs <- setdiff(pmon_peaklist.g$peakID, pmon_nearPromoters.g$peakID)
+pmon_missingPeaks.g <- pmon_peaklist.g[pmon_peaklist.g$peakID %in% pmon_missingPeakIDs]
+pmon_farPromoters.g <- ChIPpeakAnno::annotatePeakInBatch(pmon_missingPeaks.g,
+                                                                 AnnotationData = annoData,
+                                                                 output = "nearestBiDirectionalPromoters", 
+                                                                 bindingRegion = c(-100000, 100000),
+                                                                 select = "all")
+pmon_farPromoters <- data.frame(peakID = pmon_farPromoters.g$peakID,
+                                        distanceToPromoter = pmon_farPromoters.g$distanceToSite,
+                                        promoterSymbol = pmon_farPromoters.g$gene_name,
+                                        promoterENS = pmon_farPromoters.g$feature)
+pmon_promoters <- rbind(pmon_nearPromoters, pmon_farPromoters)
+pmon_promoters <- dplyr::distinct(pmon_promoters)
+```
+
+Process contrasts
+```{r process contrasts}
+pmon_contrasts <- dba.show(pmon_model_norm, bContrast = TRUE)
+pmon_contrasts <- dplyr::mutate(pmon_contrasts, name = paste0(Group, "_vs_", Group2))
+dge_pmon <- c()
+for (iContrast in 1:nrow(pmon_contrasts)) {
+  dge_ <- dba.report(pmon_model_norm, method = DBA_DESEQ2, contrast = iContrast, th = 1, DataType = DBA_DATA_FRAME)
+  dge_$peakID = as.numeric(rownames(dge_))
+  dge_ <- merge(dge_, pmon_nearestGeneBodies, by = "peakID", all.x = TRUE, no.dups = FALSE)
+  dge_ <- left_join(dge_, pmon_promoters, by = "peakID", keep = FALSE)
+  dge_$peakPosition <- paste0(dge_$Chr, ":", dge_$Start, "-", dge_$End)
+  dge_ <- dplyr::arrange(dge_, FDR) %>%
+    dplyr::filter(Chr %in% filterChr)
+  dge_pmon[[iContrast]] <- dge_
+}
+names(dge_pmon) <- pmon_contrasts$name
+```
+
+Export differential peaks
+```{r export differential peaks}
+for (contrast in names(dge_pmon)) {
+  dge_ <- dge_pmon[[contrast]]
+  out <- dge_ %>%
+    dplyr::filter(FDR < 0.05) %>%
+    dplyr::select(peakPosition, Fold, `p-value`, FDR, 
+                  promoterSymbol, promoterENS, distanceToPromoter, 
+                  closestGene, closestGeneENS, distanceToGene) %>%
+    dplyr::rename(logFC = Fold)
+  write.table(out, file = paste0("differential_peaks/exclude_irf5_tlr7/TLR7IRF5ko-TLR7-pMon_differential_peaks_annotated.csv"), sep = ",", quote = FALSE, row.names = FALSE)
+  bed <- dge_ %>%
+    dplyr::filter(FDR < 0.05) %>%
+    dplyr::select(Chr, Start, End)
+  bed <- distinct(bed)
+  bed$peakID <- 1:nrow(bed)
+  bed$blank <- "1"
+  bed$strand <- "+"
+  write.table(dplyr::select(bed, peakID, Chr, Start, End, strand), file = "differential_peaks/exclude_irf5_tlr7/TLR7IRF5ko-TLR7-pMon_differential_peaks.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  write.table(dplyr::select(bed, Chr, Start, End, strand), file = "differential_peaks/exclude_irf5_tlr7/TLR7IRF5ko-TLR7-pMon_differential_peaks_for_liftover.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  # Export minimal BED file of differential peaks for GREAT
+  minimal_bed <- bed %>%
+    dplyr::filter(Start >= 0, Chr %in% filterChr) %>%
+    dplyr::select(Chr, Start, End)
+  write.table(minimal_bed, file = "differential_peaks/exclude_irf5_tlr7/great_bed_files/TLR7IRF5ko-TLR7-pMon_differential_peaks.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  # Export BED file for peaks that are significantly more accessible (i.e. upregulated)
+  upregulated_bed <- dge_ %>%
+    dplyr::filter(FDR < 0.05 & Fold > 1) %>%
+    dplyr::select(Chr, Start, End)
+  write.table(upregulated_bed, file = "differential_peaks/exclude_irf5_tlr7/homer_bed_files/TLR7IRF5ko-TLR7-pMon_upregulated_peaks.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  # Export BED file for peaks that are significantly less accessible (i.e. downregulated)
+  downregulated_bed <- dge_ %>%
+    dplyr::filter(FDR < 0.05 & Fold < -1) %>%
+    dplyr::select(Chr, Start, End)
+  write.table(downregulated_bed, file = "differential_peaks/exclude_irf5_tlr7/homer_bed_files/TLR7IRF5ko-TLR7-pMon_downregulated_peaks.bed", sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+}
+```
+
+Find top hits
+```{r find top hits}
+pmon_top_hits <- dge_pmon[[1]] %>%
+  arrange(log10(FDR)) %>%
+  group_by(sign(Fold)) %>%
+  slice_head(n = 15)
+pmon_top_hits
+```
+
+Categorize hits and make volcano plot annotated with nearest genes
+```{r nearest gene volcano plot}
+dge_pmon_reg <- dge_pmon[[1]] %>%
+  mutate(regulation = case_when(
+    Fold > 1 & `FDR`< 0.05 ~ "up",
+    Fold < -1 & `FDR`< 0.05 ~ "down",
+    TRUE ~ "unaffected"
+  ))
+
+#pdf(file = "plots/exclude_irf5_tlr7/TLR7IRF5ko-TLR7-pMon_genes_volcano.pdf", width = 10, height = 8)
+ggplot(data = dge_pmon_reg, aes(x = Fold, y = -log10(`FDR`), color = regulation)) +
+  geom_vline(xintercept = c(-1, 1), color = "gray", linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), color = "gray", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(data = . %>%
+                    mutate(label = ifelse(peakID %in% pmon_top_hits$peakID, closestGene, "")),
+                  aes(label = label), box.padding = 0.75, force = 4, max.overlaps = Inf, show.legend = FALSE) +
+  scale_color_manual(values = c("firebrick1", "#E6E6E6", "dodgerblue1"),
+                     labels = c("Less accessible", "Not significant", "More accessible")) +
+  labs(title = "TLR7+IRF5ko vs. TLR7+ patrolling monocytes", subtitle = "Peaks labeled by nearest gene", color = "", x = expression("log"[2]*"FC"), y = expression("-log"[10]*"FDR")) +
+  theme_classic()
+#dev.off()
+```
+
+Make volcano plot annotated with nearest promoters
+```{r nearest promoter volcano plot}
+#pdf(file = "plots/exclude_irf5_tlr7/TLR7IRF5ko-TLR7-pMon_promoters_volcano.pdf", width = 10, height = 8)
+ggplot(data = dge_pmon_reg, aes(x = Fold, y = -log10(`FDR`), color = regulation)) +
+  geom_vline(xintercept = c(-1, 1), color = "gray", linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), color = "gray", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(data = . %>%
+                    mutate(label = ifelse(peakID %in% pmon_top_hits$peakID, promoterSymbol, "")),
+                  aes(label = label), box.padding = 0.75, force = 8, max.overlaps = Inf, show.legend = FALSE) +
+  scale_color_manual(values = c("firebrick1", "#E6E6E6", "dodgerblue1"),
+                     labels = c("Less accessible", "Not significant", "More accessible")) +
+  labs(title = "TLR7+IRF5ko vs. TLR7+ patrolling monocytes", subtitle = "Peaks labeled by nearest promoter", color = "", x = expression("log"[2]*"FC"), y = expression("-log"[10]*"FDR")) +
+  theme_classic()
+#dev.off()
+```
+
+Make volcano plot annotated without peak annotations
+```{r nearest promoter volcano plot}
+#pdf(file = "plots/exclude_irf5_tlr7/TLR7IRF5ko-TLR7-pMon_volcano.pdf", width = 10, height = 8)
+ggplot(data = dge_pmon_reg, aes(x = Fold, y = -log10(`FDR`), color = regulation)) +
+  geom_vline(xintercept = c(-1, 1), color = "gray", linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), color = "gray", linetype = "dashed") +
+  geom_point() +
+  scale_color_manual(values = c("firebrick1", "#E6E6E6", "dodgerblue1"),
+                     labels = c("Less accessible", "Not significant", "More accessible")) +
+  labs(title = "TLR7+IRF5ko vs. TLR7+ patrolling monocytes", color = "", x = expression("log"[2]*"FC"), y = expression("-log"[10]*"FDR")) +
+  theme_classic()
+#dev.off()
+```
+
+Determine how many peaks are more, less, or not differentially accessible
+```{r peak counts}
+dge_peaks_only_pmon <- dge_pmon_reg[, !(names(dge_pmon_reg) %in% c("closestGene", "distanceToGene", "closestGeneENS", "distanceToPromoter", "promoterSymbol", "promoterENS"))]
+dge_peaks_only_pmon <- unique(dge_peaks_only_pmon)
+table(dge_peaks_only_pmon$regulation)
+```
+
+## iHPC
+
+### Check if samples cluster by allele
+Count reads overlapping iHPC consensus peaks
+```{r dba count}
+ihpc_samples <- samples %>%
+  filter(grepl("iHPC", SampleID))
+consensus_peaks_ihpc <- dba(sampleSheet=ihpc_samples)
+consensus_peaks_ihpc_counts <- dba.count(consensus_peaks_ihpc, summits = TRUE)
+```
+
+```{r heatmap}
+plot(consensus_peaks_ihpc_counts)
+```
+
+```{r PCA}
+dba.plotPCA(consensus_peaks_ihpc_counts, DBA_REPLICATE)
+```
+
+## All cell types
+
+### Check how samples cluster
+Count reads overlapping all cell type consensus peaks
+```{r dba count}
+consensus_peaks <- dba(sampleSheet = samples)
+consensus_peaks_counts <- dba.count(consensus_peaks, summits = TRUE)
+```
+
+```{r heatmap}
+plot(consensus_peaks_counts)
+```
+
+```{r PCA}
+dba.plotPCA(consensus_peaks_counts, DBA_REPLICATE)
+```
